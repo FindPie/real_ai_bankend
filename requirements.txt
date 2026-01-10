@@ -1,0 +1,47 @@
+# FastAPI and ASGI server
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Pydantic for data validation
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Redis for caching (optional)
+redis==5.2.1
+
+# HTTP client
+httpx==0.28.1
+aiohttp==3.11.11
+
+# Authentication
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.20
+
+# Environment variables
+python-dotenv==1.0.1
+
+# Logging
+loguru==0.7.3
+
+# PDF and Word parsing
+pypdf==5.1.0
+python-docx==1.1.2
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.2
+
+# Development
+black==24.10.0
+isort==5.13.2
+flake8==7.1.1
+
+# Audio processing
+pyaudio==0.2.14
+websockets==12.0
