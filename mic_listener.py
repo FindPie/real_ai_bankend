@@ -30,7 +30,7 @@ from loguru import logger
 CHUNK = 1024  # 每次读取的帧数
 FORMAT = pyaudio.paInt16  # 16-bit PCM
 CHANNELS = 1  # 单声道
-RATE = 16000  # 采样率 16kHz (语音识别常用)
+RATE = 48000  # 采样率 48kHz
 
 # WebSocket 配置
 DEFAULT_HOST = "localhost"
