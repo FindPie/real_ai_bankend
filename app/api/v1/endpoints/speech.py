@@ -142,20 +142,34 @@ async def recognize_speech_stream(websocket: WebSocket):
 
     import asyncio
     import json
+    import queue
 
     recognizer = None
     audio_format = "pcm"
     sample_rate = 16000
 
-    async def send_result(text: str, is_final: bool):
-        """发送识别结果到客户端"""
-        try:
-            await websocket.send_json({
-                "text": text,
-                "is_final": is_final,
-            })
-        except Exception as e:
-            logger.error(f"发送结果失败: {e}")
+    # 使用队列在线程间传递识别结果
+    result_queue: queue.Queue = queue.Queue()
+
+    async def process_results():
+        """从队列中读取结果并发送给客户端"""
+        while True:
+            try:
+                # 非阻塞方式检查队列
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: result_queue.get(timeout=0.1)
+                )
+                if result is None:  # 停止信号
+                    break
+                await websocket.send_json(result)
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+            except Exception as e:
+                logger.error(f"发送结果失败: {e}")
+                break
+
+    # 启动结果处理任务
+    result_task = asyncio.create_task(process_results())
 
     try:
         while True:
@@ -173,7 +187,11 @@ async def recognize_speech_stream(websocket: WebSocket):
                     # 创建实时识别器
                     try:
                         def on_result(text: str, is_final: bool):
-                            asyncio.create_task(send_result(text, is_final))
+                            # 在回调线程中将结果放入队列
+                            result_queue.put({
+                                "text": text,
+                                "is_final": is_final,
+                            })
 
                         recognizer = speech_service.create_realtime_recognizer(
                             on_result=on_result,
@@ -215,6 +233,14 @@ async def recognize_speech_stream(websocket: WebSocket):
         if recognizer:
             recognizer.stop()
         await websocket.close(code=1000)
+    finally:
+        # 停止结果处理任务
+        result_queue.put(None)
+        result_task.cancel()
+        try:
+            await result_task
+        except asyncio.CancelledError:
+            pass
 
 
 @router.post(
