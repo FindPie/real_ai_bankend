@@ -18,7 +18,8 @@ from app.services.speech_service import speech_service
 router = APIRouter()
 
 # 默认大模型配置 (OpenRouter 模型 ID)
-DEFAULT_LLM_MODEL = "google/gemini-3-flash-preview"
+DEFAULT_LLM_MODEL = "google/gemini-2.5-flash-lite"
+DEFAULT_WEB_SEARCH = True  # 默认开启联网搜索
 
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
@@ -156,6 +157,7 @@ async def recognize_speech_stream(websocket: WebSocket):
     sample_rate = 16000
     enable_llm = True  # 默认启用大模型
     llm_model = DEFAULT_LLM_MODEL
+    web_search = DEFAULT_WEB_SEARCH  # 是否启用联网搜索
     conversation_history: list = []  # 对话历史
 
     # 使用队列在线程间传递识别结果
@@ -195,6 +197,7 @@ async def recognize_speech_stream(websocket: WebSocket):
                     sample_rate = message.get("sample_rate", 16000)
                     enable_llm = message.get("enable_llm", True)
                     llm_model = message.get("model", DEFAULT_LLM_MODEL)
+                    web_search = message.get("web_search", DEFAULT_WEB_SEARCH)
 
                     # 创建实时识别器
                     try:
@@ -237,7 +240,7 @@ async def recognize_speech_stream(websocket: WebSocket):
                     # 如果启用了大模型且有识别文本，调用大模型
                     if enable_llm and final_text.strip():
                         try:
-                            logger.info(f"调用大模型: {llm_model}")
+                            logger.info(f"调用大模型: {llm_model}, 联网搜索: {web_search}")
                             await websocket.send_json({
                                 "type": "llm",
                                 "status": "thinking",
@@ -251,6 +254,7 @@ async def recognize_speech_stream(websocket: WebSocket):
                             async for chunk in chat_service.send_message_stream(
                                 messages=conversation_history,
                                 model=llm_model,
+                                web_search=web_search,
                             ):
                                 full_response += chunk
                                 await websocket.send_json({
