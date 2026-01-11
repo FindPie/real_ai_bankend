@@ -11,9 +11,14 @@ from app.schemas.speech import (
     TextToSpeechRequest,
     TextToSpeechResponse,
 )
+from app.schemas.chat import Message
+from app.services.chat_service import chat_service
 from app.services.speech_service import speech_service
 
 router = APIRouter()
+
+# 默认大模型配置 (OpenRouter 模型 ID)
+DEFAULT_LLM_MODEL = "google/gemini-3-flash-preview"
 
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
@@ -127,15 +132,17 @@ async def recognize_speech_upload(
 @router.websocket("/recognize/stream")
 async def recognize_speech_stream(websocket: WebSocket):
     """
-    实时语音识别 - WebSocket 流式接口 (使用 DashScope)
+    实时语音识别 + 大模型对话 - WebSocket 流式接口
 
-    用于接收麦克风实时音频流，实时返回识别结果
+    用于接收麦克风实时音频流，实时返回识别结果，并在识别完成后调用大模型
 
     协议:
-    1. 客户端发送 JSON 配置: {"action": "start", "format": "pcm", "sample_rate": 16000}
+    1. 客户端发送 JSON 配置: {"action": "start", "format": "pcm", "sample_rate": 16000, "enable_llm": true}
     2. 客户端发送二进制音频数据 (持续)
-    3. 服务端返回识别结果: {"text": "识别的文字", "is_final": false}
+    3. 服务端返回识别结果: {"type": "recognition", "text": "识别的文字", "is_final": false}
     4. 客户端发送: {"action": "stop"} 结束识别
+    5. 如果启用 LLM，服务端返回: {"type": "llm", "content": "大模型回复", "done": false}
+    6. LLM 回复完成: {"type": "llm", "content": "", "done": true}
     """
     await websocket.accept()
     logger.info("WebSocket 连接已建立")
@@ -147,6 +154,9 @@ async def recognize_speech_stream(websocket: WebSocket):
     recognizer = None
     audio_format = "pcm"
     sample_rate = 16000
+    enable_llm = True  # 默认启用大模型
+    llm_model = DEFAULT_LLM_MODEL
+    conversation_history: list = []  # 对话历史
 
     # 使用队列在线程间传递识别结果
     result_queue: queue.Queue = queue.Queue()
@@ -183,12 +193,15 @@ async def recognize_speech_stream(websocket: WebSocket):
                 if action == "start":
                     audio_format = message.get("format", "pcm")
                     sample_rate = message.get("sample_rate", 16000)
+                    enable_llm = message.get("enable_llm", True)
+                    llm_model = message.get("model", DEFAULT_LLM_MODEL)
 
                     # 创建实时识别器
                     try:
                         def on_result(text: str, is_final: bool):
                             # 在回调线程中将结果放入队列
                             result_queue.put({
+                                "type": "recognition",
                                 "text": text,
                                 "is_final": is_final,
                             })
@@ -199,25 +212,75 @@ async def recognize_speech_stream(websocket: WebSocket):
                             audio_format=audio_format,
                         )
                         recognizer.start()
-                        logger.info(f"开始实时识别: format={audio_format}, sample_rate={sample_rate}")
-                        await websocket.send_json({"status": "started"})
+                        logger.info(f"开始实时识别: format={audio_format}, sample_rate={sample_rate}, enable_llm={enable_llm}")
+                        await websocket.send_json({"status": "started", "enable_llm": enable_llm})
 
                     except Exception as e:
                         logger.error(f"启动识别器失败: {e}")
                         await websocket.send_json({"error": str(e)})
 
                 elif action == "stop":
+                    final_text = ""
                     if recognizer:
-                        final_text = recognizer.stop()
+                        final_text = recognizer.stop() or ""
                         if final_text:
                             await websocket.send_json({
+                                "type": "recognition",
                                 "text": final_text,
                                 "is_final": True,
                             })
                         recognizer = None
 
-                    logger.info("实时识别结束")
+                    logger.info(f"实时识别结束, 最终文本: {final_text}")
                     await websocket.send_json({"status": "stopped"})
+
+                    # 如果启用了大模型且有识别文本，调用大模型
+                    if enable_llm and final_text.strip():
+                        try:
+                            logger.info(f"调用大模型: {llm_model}")
+                            await websocket.send_json({
+                                "type": "llm",
+                                "status": "thinking",
+                            })
+
+                            # 添加用户消息到对话历史
+                            conversation_history.append(Message(role="user", content=final_text))
+
+                            # 流式调用大模型
+                            full_response = ""
+                            async for chunk in chat_service.send_message_stream(
+                                messages=conversation_history,
+                                model=llm_model,
+                            ):
+                                full_response += chunk
+                                await websocket.send_json({
+                                    "type": "llm",
+                                    "content": chunk,
+                                    "done": False,
+                                })
+
+                            # 添加助手回复到对话历史
+                            conversation_history.append(Message(role="assistant", content=full_response))
+
+                            await websocket.send_json({
+                                "type": "llm",
+                                "content": "",
+                                "done": True,
+                                "full_response": full_response,
+                            })
+                            logger.info(f"大模型回复完成: {full_response[:100]}...")
+
+                        except Exception as e:
+                            logger.error(f"大模型调用失败: {e}")
+                            await websocket.send_json({
+                                "type": "llm",
+                                "error": str(e),
+                            })
+
+                elif action == "clear_history":
+                    # 清空对话历史
+                    conversation_history.clear()
+                    await websocket.send_json({"status": "history_cleared"})
 
             # 处理二进制数据 (音频流)
             elif "bytes" in data:

@@ -139,7 +139,8 @@ class MicrophoneListener:
             return False
 
     async def receive_results(self) -> None:
-        """接收识别结果的协程"""
+        """接收识别结果和大模型回复的协程"""
+        llm_response = ""
         try:
             while self.running and self.websocket:
                 try:
@@ -149,21 +150,45 @@ class MicrophoneListener:
                     )
                     data = json.loads(response)
 
-                    if "text" in data:
-                        text = data["text"]
+                    msg_type = data.get("type", "")
+
+                    # 语音识别结果
+                    if msg_type == "recognition":
+                        text = data.get("text", "")
                         is_final = data.get("is_final", False)
-                        confidence = data.get("confidence", 0)
 
                         if is_final:
-                            logger.success(f"[最终结果] {text} (置信度: {confidence:.2f})")
+                            logger.success(f"[语音识别] {text}")
                         else:
                             logger.info(f"[实时识别] {text}")
 
+                    # 大模型回复
+                    elif msg_type == "llm":
+                        if data.get("status") == "thinking":
+                            logger.info("[AI] 正在思考...")
+                            llm_response = ""
+                        elif data.get("error"):
+                            logger.error(f"[AI 错误] {data['error']}")
+                        elif data.get("done"):
+                            # 回复完成
+                            logger.success(f"[AI 回复] {data.get('full_response', llm_response)}")
+                        else:
+                            # 流式输出
+                            chunk = data.get("content", "")
+                            llm_response += chunk
+                            print(chunk, end="", flush=True)
+
                     elif "error" in data:
-                        logger.error(f"识别错误: {data['error']}")
+                        logger.error(f"错误: {data['error']}")
 
                     elif "status" in data:
-                        logger.debug(f"状态: {data['status']}")
+                        status = data["status"]
+                        if status == "started":
+                            logger.info(f"识别已启动 (LLM: {data.get('enable_llm', True)})")
+                        elif status == "stopped":
+                            logger.debug("识别已停止")
+                        else:
+                            logger.debug(f"状态: {status}")
 
                 except asyncio.TimeoutError:
                     continue
