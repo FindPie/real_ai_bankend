@@ -1,20 +1,161 @@
+import asyncio
 import base64
-import io
-from typing import Optional
+import queue
+import threading
+from typing import AsyncGenerator, Callable, Optional
 
+import dashscope
+from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
 from loguru import logger
 
 from app.core.config import settings
 from app.schemas.speech import SpeechToTextResponse, TextToSpeechResponse
 
 
+class RealtimeRecognitionCallback(RecognitionCallback):
+    """实时语音识别回调"""
+
+    def __init__(self, on_result: Callable[[str, bool], None]):
+        self.on_result = on_result
+        self.result_queue: queue.Queue = queue.Queue()
+        self.is_open = False
+        self.error_message: Optional[str] = None
+
+    def on_open(self) -> None:
+        logger.info("DashScope 语音识别连接已建立")
+        self.is_open = True
+
+    def on_close(self) -> None:
+        logger.info("DashScope 语音识别连接已关闭")
+        self.is_open = False
+        self.result_queue.put(None)  # 结束信号
+
+    def on_complete(self) -> None:
+        logger.info("DashScope 语音识别完成")
+
+    def on_error(self, message) -> None:
+        self.error_message = str(message.message)
+        logger.error(f"DashScope 语音识别错误: {message.message}")
+        self.result_queue.put(None)
+
+    def on_event(self, result: RecognitionResult) -> None:
+        sentence = result.get_sentence()
+        if "text" in sentence:
+            text = sentence["text"]
+            is_final = RecognitionResult.is_sentence_end(sentence)
+            logger.debug(f"识别结果: {text}, is_final: {is_final}")
+            self.result_queue.put({"text": text, "is_final": is_final})
+            if self.on_result:
+                self.on_result(text, is_final)
+
+
+class RealtimeRecognizer:
+    """实时语音识别器"""
+
+    def __init__(
+        self,
+        on_result: Optional[Callable[[str, bool], None]] = None,
+        sample_rate: int = 16000,
+        audio_format: str = "pcm",
+    ):
+        self.sample_rate = sample_rate
+        self.audio_format = audio_format
+        self.recognition: Optional[Recognition] = None
+        self.callback: Optional[RealtimeRecognitionCallback] = None
+        self._on_result = on_result
+
+        # 配置 DashScope
+        if not settings.dashscope_api_key:
+            raise ValueError("DASHSCOPE_API_KEY 未配置")
+
+        dashscope.api_key = settings.dashscope_api_key
+        dashscope.base_websocket_api_url = settings.dashscope_websocket_url
+
+    def start(self) -> None:
+        """启动语音识别"""
+        self.callback = RealtimeRecognitionCallback(on_result=self._on_result)
+
+        self.recognition = Recognition(
+            model="paraformer-realtime-v2",
+            format=self.audio_format,
+            sample_rate=self.sample_rate,
+            semantic_punctuation_enabled=False,
+            callback=self.callback,
+        )
+
+        self.recognition.start()
+        logger.info(
+            f"实时语音识别已启动 (采样率: {self.sample_rate}, 格式: {self.audio_format})"
+        )
+
+    def send_audio(self, audio_data: bytes) -> None:
+        """发送音频数据"""
+        if self.recognition:
+            self.recognition.send_audio_frame(audio_data)
+
+    def stop(self) -> Optional[str]:
+        """停止语音识别并返回最终结果"""
+        if self.recognition:
+            self.recognition.stop()
+            logger.info("实时语音识别已停止")
+
+            # 收集所有结果
+            final_text = ""
+            while True:
+                try:
+                    result = self.callback.result_queue.get(timeout=1.0)
+                    if result is None:
+                        break
+                    if result.get("is_final"):
+                        final_text = result.get("text", "")
+                except queue.Empty:
+                    break
+
+            return final_text
+        return None
+
+    def get_results(self) -> AsyncGenerator[dict, None]:
+        """异步获取识别结果"""
+
+        async def _get_results():
+            while True:
+                try:
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: self.callback.result_queue.get(timeout=0.1)
+                    )
+                    if result is None:
+                        break
+                    yield result
+                except queue.Empty:
+                    await asyncio.sleep(0.01)
+
+        return _get_results()
+
+
 class SpeechService:
-    """语音服务 - 支持阿里云语音识别"""
+    """语音服务 - 支持阿里云 DashScope 语音识别"""
 
     def __init__(self):
-        self.aliyun_access_key_id = settings.aliyun_access_key_id
-        self.aliyun_access_key_secret = settings.aliyun_access_key_secret
-        self.aliyun_app_key = settings.aliyun_speech_app_key
+        self.dashscope_api_key = settings.dashscope_api_key
+        self.dashscope_websocket_url = settings.dashscope_websocket_url
+
+        # 配置 DashScope (如果有 API Key)
+        if self.dashscope_api_key:
+            dashscope.api_key = self.dashscope_api_key
+            dashscope.base_websocket_api_url = self.dashscope_websocket_url
+
+    def create_realtime_recognizer(
+        self,
+        on_result: Optional[Callable[[str, bool], None]] = None,
+        sample_rate: int = 16000,
+        audio_format: str = "pcm",
+    ) -> RealtimeRecognizer:
+        """创建实时语音识别器"""
+        return RealtimeRecognizer(
+            on_result=on_result,
+            sample_rate=sample_rate,
+            audio_format=audio_format,
+        )
 
     async def speech_to_text(
         self,
@@ -24,7 +165,7 @@ class SpeechService:
         language: str = "zh-CN",
     ) -> SpeechToTextResponse:
         """
-        语音转文字
+        语音转文字 (一次性识别)
 
         Args:
             audio_data: Base64 编码的音频数据
@@ -40,15 +181,22 @@ class SpeechService:
             audio_bytes = base64.b64decode(audio_data)
             logger.info(f"接收到音频数据: {len(audio_bytes)} bytes, 格式: {audio_format}")
 
-            # TODO: 集成阿里云语音识别 API
-            # 目前返回占位响应，等待阿里云 API 配置
-            text = await self._call_aliyun_asr(
-                audio_bytes, audio_format, sample_rate, language
+            if not self.dashscope_api_key:
+                logger.warning("DASHSCOPE_API_KEY 未配置，返回模拟响应")
+                return SpeechToTextResponse(
+                    text="[DashScope API Key 未配置，请在 .env 中设置 DASHSCOPE_API_KEY]",
+                    duration=len(audio_bytes) / (sample_rate * 2),
+                    confidence=0.0,
+                )
+
+            # 使用同步方式进行一次性识别
+            result_text = await self._recognize_audio(
+                audio_bytes, audio_format, sample_rate
             )
 
             return SpeechToTextResponse(
-                text=text,
-                duration=len(audio_bytes) / (sample_rate * 2),  # 估算时长
+                text=result_text,
+                duration=len(audio_bytes) / (sample_rate * 2),
                 confidence=0.95,
             )
 
@@ -56,131 +204,74 @@ class SpeechService:
             logger.error(f"语音识别失败: {e}")
             raise Exception(f"语音识别失败: {str(e)}")
 
-    async def _call_aliyun_asr(
+    async def _recognize_audio(
         self,
         audio_bytes: bytes,
         audio_format: str,
         sample_rate: int,
-        language: str,
     ) -> str:
-        """
-        调用阿里云语音识别 API
+        """使用 DashScope 进行语音识别"""
+        result_text = ""
+        recognition_done = threading.Event()
+        error_message = None
 
-        阿里云一句话识别 API 文档:
-        https://help.aliyun.com/document_detail/92131.html
-        """
-        # 检查配置
-        if not self.aliyun_access_key_id or not self.aliyun_access_key_secret:
-            logger.warning("阿里云 AccessKey 未配置，使用模拟响应")
-            return "[阿里云语音识别未配置，请在 .env 中设置 ALIYUN_ACCESS_KEY_ID 和 ALIYUN_ACCESS_KEY_SECRET]"
+        class OneTimeCallback(RecognitionCallback):
+            def on_open(self) -> None:
+                logger.debug("一次性识别连接已建立")
 
-        try:
-            # 使用阿里云 NLS SDK
-            import nls
+            def on_close(self) -> None:
+                logger.debug("一次性识别连接已关闭")
+                recognition_done.set()
 
-            # 创建识别请求
-            sr = nls.NlsSpeechRecognizer(
-                url="wss://nls-gateway.cn-shanghai.aliyuncs.com/ws/v1",
-                akid=self.aliyun_access_key_id,
-                aksecret=self.aliyun_access_key_secret,
-                appkey=self.aliyun_app_key,
-            )
+            def on_complete(self) -> None:
+                logger.debug("一次性识别完成")
+                recognition_done.set()
 
-            result_text = ""
+            def on_error(self, message) -> None:
+                nonlocal error_message
+                error_message = str(message.message)
+                logger.error(f"一次性识别错误: {message.message}")
+                recognition_done.set()
 
-            def on_result(message, *args):
+            def on_event(self, result: RecognitionResult) -> None:
                 nonlocal result_text
-                result_text = message
+                sentence = result.get_sentence()
+                if "text" in sentence:
+                    result_text = sentence["text"]
 
-            sr.on_result_changed = on_result
-            sr.on_sentence_end = on_result
+        callback = OneTimeCallback()
 
-            # 开始识别
-            sr.start(
-                aformat=audio_format,
-                sample_rate=sample_rate,
-                enable_punctuation_prediction=True,
-                enable_inverse_text_normalization=True,
-            )
+        recognition = Recognition(
+            model="paraformer-realtime-v2",
+            format=audio_format,
+            sample_rate=sample_rate,
+            semantic_punctuation_enabled=True,
+            callback=callback,
+        )
 
-            # 发送音频数据
-            sr.send_audio(audio_bytes)
-            sr.stop()
+        # 在线程中运行识别
+        def run_recognition():
+            recognition.start()
+            # 分块发送音频数据
+            chunk_size = 3200
+            for i in range(0, len(audio_bytes), chunk_size):
+                chunk = audio_bytes[i : i + chunk_size]
+                recognition.send_audio_frame(chunk)
+            recognition.stop()
 
-            return result_text or "无法识别"
+        thread = threading.Thread(target=run_recognition)
+        thread.start()
 
-        except ImportError:
-            logger.warning("阿里云 NLS SDK 未安装，使用 HTTP API 方式")
-            return await self._call_aliyun_asr_http(
-                audio_bytes, audio_format, sample_rate
-            )
-        except Exception as e:
-            logger.error(f"阿里云语音识别调用失败: {e}")
-            raise
+        # 等待识别完成
+        await asyncio.get_event_loop().run_in_executor(
+            None, lambda: recognition_done.wait(timeout=30)
+        )
+        thread.join(timeout=5)
 
-    async def _call_aliyun_asr_http(
-        self,
-        audio_bytes: bytes,
-        audio_format: str,
-        sample_rate: int,
-    ) -> str:
-        """
-        使用 HTTP 方式调用阿里云语音识别 (一句话识别 RESTful API)
-        """
-        import hashlib
-        import hmac
-        import time
-        import uuid
-        from urllib.parse import quote
+        if error_message:
+            raise Exception(error_message)
 
-        import httpx
-
-        # 阿里云一句话识别 API 地址
-        url = "https://nls-gateway.cn-shanghai.aliyuncs.com/stream/v1/asr"
-
-        # 请求参数
-        params = {
-            "appkey": self.aliyun_app_key,
-            "format": audio_format,
-            "sample_rate": sample_rate,
-            "enable_punctuation_prediction": "true",
-            "enable_inverse_text_normalization": "true",
-        }
-
-        # 构建签名 (简化版，实际需要完整的阿里云签名)
-        headers = {
-            "Content-Type": f"audio/{audio_format}; samplerate={sample_rate}",
-            "X-NLS-Token": await self._get_aliyun_token(),
-        }
-
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                url,
-                params=params,
-                headers=headers,
-                content=audio_bytes,
-            )
-
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("result", "无法识别")
-            else:
-                logger.error(f"阿里云 ASR 请求失败: {response.status_code} {response.text}")
-                raise Exception(f"语音识别请求失败: {response.status_code}")
-
-    async def _get_aliyun_token(self) -> str:
-        """获取阿里云 NLS Token"""
-        import httpx
-
-        url = "https://nls-meta.cn-shanghai.aliyuncs.com/"
-
-        # 这里需要使用阿里云签名机制获取 Token
-        # 简化实现，实际需要完整的签名
-        async with httpx.AsyncClient() as client:
-            # TODO: 实现完整的阿里云签名获取 Token
-            pass
-
-        return ""
+        return result_text or "无法识别"
 
     async def text_to_speech(
         self,
@@ -210,7 +301,7 @@ class SpeechService:
         return TextToSpeechResponse(
             audio_data="",
             audio_format=audio_format,
-            duration=len(text) * 0.3,  # 估算时长
+            duration=len(text) * 0.3,
         )
 
 

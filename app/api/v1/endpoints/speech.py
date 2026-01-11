@@ -127,7 +127,7 @@ async def recognize_speech_upload(
 @router.websocket("/recognize/stream")
 async def recognize_speech_stream(websocket: WebSocket):
     """
-    实时语音识别 - WebSocket 流式接口
+    实时语音识别 - WebSocket 流式接口 (使用 DashScope)
 
     用于接收麦克风实时音频流，实时返回识别结果
 
@@ -140,9 +140,22 @@ async def recognize_speech_stream(websocket: WebSocket):
     await websocket.accept()
     logger.info("WebSocket 连接已建立")
 
-    audio_buffer = bytearray()
+    import asyncio
+    import json
+
+    recognizer = None
     audio_format = "pcm"
     sample_rate = 16000
+
+    async def send_result(text: str, is_final: bool):
+        """发送识别结果到客户端"""
+        try:
+            await websocket.send_json({
+                "text": text,
+                "is_final": is_final,
+            })
+        except Exception as e:
+            logger.error(f"发送结果失败: {e}")
 
     try:
         while True:
@@ -150,64 +163,57 @@ async def recognize_speech_stream(websocket: WebSocket):
 
             # 处理文本消息 (控制命令)
             if "text" in data:
-                import json
                 message = json.loads(data["text"])
                 action = message.get("action")
 
                 if action == "start":
                     audio_format = message.get("format", "pcm")
                     sample_rate = message.get("sample_rate", 16000)
-                    audio_buffer.clear()
-                    logger.info(f"开始录音: format={audio_format}, sample_rate={sample_rate}")
-                    await websocket.send_json({"status": "started"})
+
+                    # 创建实时识别器
+                    try:
+                        def on_result(text: str, is_final: bool):
+                            asyncio.create_task(send_result(text, is_final))
+
+                        recognizer = speech_service.create_realtime_recognizer(
+                            on_result=on_result,
+                            sample_rate=sample_rate,
+                            audio_format=audio_format,
+                        )
+                        recognizer.start()
+                        logger.info(f"开始实时识别: format={audio_format}, sample_rate={sample_rate}")
+                        await websocket.send_json({"status": "started"})
+
+                    except Exception as e:
+                        logger.error(f"启动识别器失败: {e}")
+                        await websocket.send_json({"error": str(e)})
 
                 elif action == "stop":
-                    # 处理累积的音频数据
-                    if audio_buffer:
-                        audio_base64 = base64.b64encode(bytes(audio_buffer)).decode("utf-8")
-                        try:
-                            result = await speech_service.speech_to_text(
-                                audio_data=audio_base64,
-                                audio_format=audio_format,
-                                sample_rate=sample_rate,
-                            )
+                    if recognizer:
+                        final_text = recognizer.stop()
+                        if final_text:
                             await websocket.send_json({
-                                "text": result.text,
+                                "text": final_text,
                                 "is_final": True,
-                                "confidence": result.confidence,
                             })
-                        except Exception as e:
-                            await websocket.send_json({"error": str(e)})
+                        recognizer = None
 
-                    audio_buffer.clear()
-                    logger.info("录音结束")
+                    logger.info("实时识别结束")
                     await websocket.send_json({"status": "stopped"})
 
             # 处理二进制数据 (音频流)
             elif "bytes" in data:
-                audio_buffer.extend(data["bytes"])
-
-                # 每收集一定量的数据就进行识别 (实时识别)
-                # 这里可以根据需要调整阈值
-                if len(audio_buffer) >= sample_rate * 2:  # 约 1 秒的数据
-                    audio_base64 = base64.b64encode(bytes(audio_buffer)).decode("utf-8")
-                    try:
-                        result = await speech_service.speech_to_text(
-                            audio_data=audio_base64,
-                            audio_format=audio_format,
-                            sample_rate=sample_rate,
-                        )
-                        await websocket.send_json({
-                            "text": result.text,
-                            "is_final": False,
-                        })
-                    except Exception as e:
-                        logger.error(f"实时识别错误: {e}")
+                if recognizer:
+                    recognizer.send_audio(data["bytes"])
 
     except WebSocketDisconnect:
         logger.info("WebSocket 连接已断开")
+        if recognizer:
+            recognizer.stop()
     except Exception as e:
         logger.error(f"WebSocket 错误: {e}")
+        if recognizer:
+            recognizer.stop()
         await websocket.close(code=1000)
 
 

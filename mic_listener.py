@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import signal
+import struct
 import sys
 from typing import Optional
 
@@ -27,15 +28,47 @@ import websockets
 from loguru import logger
 
 # 音频配置
-CHUNK = 1024  # 每次读取的帧数
 FORMAT = pyaudio.paInt16  # 16-bit PCM
 CHANNELS = 1  # 单声道
-RATE = 48000  # 采样率 48kHz
+
+# 设备采样率 (麦克风实际采样率)
+DEVICE_RATE = 48000
+
+# 目标采样率 (DashScope 支持 8000 和 16000)
+TARGET_RATE = 16000
+
+# 重采样比例
+RESAMPLE_RATIO = DEVICE_RATE // TARGET_RATE  # 48000 / 16000 = 3
+
+# 每次读取的帧数 (按设备采样率计算，约 200ms 的数据)
+# 48000 * 0.2 = 9600 帧，重采样后变成 3200 帧
+CHUNK = 9600
 
 # WebSocket 配置
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 WS_PATH = "/api/v1/speech/recognize/stream"
+
+
+def resample_audio(audio_data: bytes, ratio: int) -> bytes:
+    """
+    简单重采样：每隔 ratio 个采样点取一个
+
+    Args:
+        audio_data: 原始音频数据 (16-bit PCM)
+        ratio: 重采样比例 (例如 3 表示 48000 -> 16000)
+
+    Returns:
+        重采样后的音频数据
+    """
+    # 将 bytes 转换为 16-bit 整数列表
+    samples = struct.unpack(f"<{len(audio_data) // 2}h", audio_data)
+
+    # 每隔 ratio 个采样点取一个
+    resampled = samples[::ratio]
+
+    # 转换回 bytes
+    return struct.pack(f"<{len(resampled)}h", *resampled)
 
 
 class MicrophoneListener:
@@ -83,11 +116,11 @@ class MicrophoneListener:
             self.websocket = await websockets.connect(self.ws_url)
             logger.info("WebSocket 连接成功")
 
-            # 发送开始命令
+            # 发送开始命令 (使用目标采样率)
             start_msg = {
                 "action": "start",
                 "format": "pcm",
-                "sample_rate": RATE,
+                "sample_rate": TARGET_RATE,
             }
             await self.websocket.send(json.dumps(start_msg))
 
@@ -146,9 +179,14 @@ class MicrophoneListener:
         try:
             while self.running and self.stream and self.websocket:
                 try:
-                    # 读取音频数据 (非阻塞)
+                    # 读取音频数据 (48kHz)
                     data = self.stream.read(CHUNK, exception_on_overflow=False)
-                    await self.websocket.send(data)
+
+                    # 重采样到 16kHz
+                    resampled_data = resample_audio(data, RESAMPLE_RATIO)
+
+                    # 发送重采样后的数据
+                    await self.websocket.send(resampled_data)
                     await asyncio.sleep(0.01)  # 小延迟避免过载
 
                 except IOError as e:
@@ -175,17 +213,17 @@ class MicrophoneListener:
 
         logger.info(f"使用音频设备索引: {device}")
 
-        # 打开音频流
+        # 打开音频流 (使用设备原生采样率)
         try:
             self.stream = self.audio.open(
                 format=FORMAT,
                 channels=CHANNELS,
-                rate=RATE,
+                rate=DEVICE_RATE,
                 input=True,
                 input_device_index=device,
                 frames_per_buffer=CHUNK,
             )
-            logger.info(f"音频流已打开 (采样率: {RATE}Hz, 声道: {CHANNELS})")
+            logger.info(f"音频流已打开 (设备采样率: {DEVICE_RATE}Hz -> 目标: {TARGET_RATE}Hz)")
 
         except IOError as e:
             logger.error(f"无法打开音频设备: {e}")

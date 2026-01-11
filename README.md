@@ -187,14 +187,14 @@ python mic_listener.py --host 192.168.1.100 -p 8000
 | `--host` | WebSocket 服务器地址 | localhost |
 | `-p`, `--port` | WebSocket 服务器端口 | 8000 |
 
-#### 音频配置
+#### 音频配置 (适配 DashScope)
 
 | 参数 | 值 |
 |------|-----|
-| 采样率 | 48000 Hz |
+| 采样率 | 16000 Hz (DashScope 支持 8000/16000) |
 | 声道 | 单声道 |
 | 格式 | 16-bit PCM |
-| 缓冲区 | 1024 帧 |
+| 缓冲区 | 3200 帧 (约 200ms) |
 
 #### Docker 音频设备映射
 
@@ -212,8 +212,8 @@ services:
 #### WebSocket 协议
 
 1. 客户端连接: `ws://host:port/api/v1/speech/recognize/stream`
-2. 发送启动命令: `{"action": "start", "format": "pcm", "sample_rate": 48000}`
-3. 持续发送二进制音频数据
+2. 发送启动命令: `{"action": "start", "format": "pcm", "sample_rate": 16000}`
+3. 持续发送二进制音频数据 (16-bit PCM, 单声道)
 4. 接收识别结果: `{"text": "识别的文字", "is_final": false}`
 5. 发送停止命令: `{"action": "stop"}`
 

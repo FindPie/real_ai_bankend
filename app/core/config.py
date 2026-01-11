@@ -39,10 +39,14 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_api_url: str = "https://openrouter.ai/api/v1/chat/completions"
 
-    # 阿里云语音服务配置
+    # 阿里云语音服务配置 (旧版 NLS)
     aliyun_access_key_id: str = ""
     aliyun_access_key_secret: str = ""
     aliyun_speech_app_key: str = ""
+
+    # 阿里云 DashScope 语音识别配置
+    dashscope_api_key: str = ""
+    dashscope_websocket_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 
 
 @lru_cache()
