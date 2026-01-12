@@ -3,6 +3,7 @@
 麦克风实时监听脚本
 
 从麦克风捕获音频并通过 WebSocket 发送到后端进行实时语音识别。
+支持 TTS 语音合成播放。
 
 用法:
     python mic_listener.py [--device DEVICE_INDEX] [--host HOST] [--port PORT]
@@ -17,10 +18,13 @@ Docker 音频设备配置:
 
 import argparse
 import asyncio
+import base64
 import json
+import queue
 import signal
 import struct
 import sys
+import threading
 from typing import Optional
 
 import pyaudio
@@ -48,6 +52,94 @@ CHUNK = 9600
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 8000
 WS_PATH = "/api/v1/speech/recognize/stream"
+
+# TTS 播放配置
+TTS_SAMPLE_RATE = 22050  # TTS 输出采样率 (与服务端一致)
+TTS_CHANNELS = 1
+TTS_FORMAT = pyaudio.paInt16
+
+# 唤醒词配置
+DEFAULT_WAKE_WORD = "贾维斯"
+DEFAULT_WAKE_WORD_ENABLED = True
+
+
+class AudioPlayer:
+    """音频播放器 - 用于播放 TTS 合成的语音"""
+
+    def __init__(self, audio: pyaudio.PyAudio):
+        self.audio = audio
+        self.stream: Optional[pyaudio.Stream] = None
+        self.audio_queue: queue.Queue = queue.Queue()
+        self.running = False
+        self._play_thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        """启动播放器"""
+        if self.stream is not None:
+            return
+
+        try:
+            self.stream = self.audio.open(
+                format=TTS_FORMAT,
+                channels=TTS_CHANNELS,
+                rate=TTS_SAMPLE_RATE,
+                output=True,
+                frames_per_buffer=4096,
+            )
+            self.running = True
+
+            # 启动播放线程
+            self._play_thread = threading.Thread(target=self._play_loop, daemon=True)
+            self._play_thread.start()
+
+            logger.info(f"音频播放器已启动 (采样率: {TTS_SAMPLE_RATE}Hz)")
+        except Exception as e:
+            logger.error(f"启动音频播放器失败: {e}")
+
+    def _play_loop(self) -> None:
+        """播放循环 (在单独线程中运行)"""
+        while self.running:
+            try:
+                audio_data = self.audio_queue.get(timeout=0.1)
+                if audio_data is None:  # 停止信号
+                    break
+                if self.stream:
+                    self.stream.write(audio_data)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logger.error(f"播放音频时出错: {e}")
+
+    def play(self, audio_data: bytes) -> None:
+        """将音频数据加入播放队列"""
+        if self.running:
+            self.audio_queue.put(audio_data)
+
+    def stop(self) -> None:
+        """停止播放器"""
+        self.running = False
+        self.audio_queue.put(None)  # 发送停止信号
+
+        if self._play_thread:
+            self._play_thread.join(timeout=1.0)
+            self._play_thread = None
+
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except Exception:
+                pass
+            self.stream = None
+
+        # 清空队列
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        logger.info("音频播放器已停止")
 
 
 def resample_audio(audio_data: bytes, ratio: int) -> bytes:
@@ -79,6 +171,9 @@ class MicrophoneListener:
         device_index: Optional[int] = None,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
+        enable_tts: bool = True,
+        wake_word_enabled: bool = DEFAULT_WAKE_WORD_ENABLED,
+        wake_word: str = DEFAULT_WAKE_WORD,
     ):
         self.device_index = device_index
         self.ws_url = f"ws://{host}:{port}{WS_PATH}"
@@ -86,6 +181,10 @@ class MicrophoneListener:
         self.stream: Optional[pyaudio.Stream] = None
         self.running = False
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
+        self.enable_tts = enable_tts
+        self.wake_word_enabled = wake_word_enabled
+        self.wake_word = wake_word
+        self.audio_player: Optional[AudioPlayer] = None
 
     def list_devices(self) -> None:
         """列出所有可用的音频输入设备"""
@@ -121,8 +220,13 @@ class MicrophoneListener:
                 "action": "start",
                 "format": "pcm",
                 "sample_rate": TARGET_RATE,
+                "enable_tts": self.enable_tts,
+                "wake_word_enabled": self.wake_word_enabled,
+                "wake_word": self.wake_word,
             }
             await self.websocket.send(json.dumps(start_msg))
+            if self.wake_word_enabled:
+                logger.info(f"唤醒词已启用: '{self.wake_word}'")
 
             # 等待确认
             response = await self.websocket.recv()
@@ -167,16 +271,37 @@ class MicrophoneListener:
                         if data.get("status") == "thinking":
                             logger.info("[AI] 正在思考...")
                             llm_response = ""
+                            # 启动音频播放器 (准备接收 TTS 音频)
+                            if self.enable_tts and self.audio_player:
+                                self.audio_player.start()
                         elif data.get("error"):
                             logger.error(f"[AI 错误] {data['error']}")
                         elif data.get("done"):
                             # 回复完成
-                            logger.success(f"[AI 回复] {data.get('full_response', llm_response)}")
+                            print()  # 换行
+                            logger.success(f"[AI 回复完成]")
                         else:
                             # 流式输出
                             chunk = data.get("content", "")
                             llm_response += chunk
                             print(chunk, end="", flush=True)
+
+                    # TTS 音频数据
+                    elif msg_type == "tts_audio":
+                        if data.get("done"):
+                            logger.debug("[TTS] 音频播放完成")
+                        else:
+                            # 解码并播放音频
+                            audio_data = data.get("data", "")
+                            if audio_data and self.audio_player:
+                                audio_bytes = base64.b64decode(audio_data)
+                                self.audio_player.play(audio_bytes)
+
+                    # 唤醒词检测
+                    elif msg_type == "wake_word":
+                        if data.get("status") == "activated":
+                            wake_word = data.get("wake_word", "")
+                            logger.success(f"[唤醒词] 检测到 '{wake_word}'，已激活!")
 
                     elif "error" in data:
                         logger.error(f"错误: {data['error']}")
@@ -255,6 +380,11 @@ class MicrophoneListener:
             self.list_devices()
             return
 
+        # 初始化音频播放器 (用于 TTS)
+        if self.enable_tts:
+            self.audio_player = AudioPlayer(self.audio)
+            logger.info("TTS 音频播放器已初始化")
+
         # 连接 WebSocket
         if not await self.connect_websocket():
             self.stream.close()
@@ -296,6 +426,11 @@ class MicrophoneListener:
             except Exception as e:
                 logger.debug(f"关闭 WebSocket 时出错: {e}")
 
+        # 停止音频播放器
+        if self.audio_player:
+            self.audio_player.stop()
+            self.audio_player = None
+
         # 关闭音频流
         if self.stream:
             self.stream.stop_stream()
@@ -307,6 +442,8 @@ class MicrophoneListener:
     def cleanup(self) -> None:
         """清理资源 (同步版本，用于信号处理)"""
         self.running = False
+        if self.audio_player:
+            self.audio_player.stop()
         if self.stream:
             try:
                 self.stream.stop_stream()
@@ -341,6 +478,22 @@ async def main():
         action="store_true",
         help="列出可用的音频设备"
     )
+    parser.add_argument(
+        "--no-tts",
+        action="store_true",
+        help="禁用 TTS 语音合成播放"
+    )
+    parser.add_argument(
+        "--no-wake-word",
+        action="store_true",
+        help="禁用唤醒词检测"
+    )
+    parser.add_argument(
+        "--wake-word", "-w",
+        type=str,
+        default=DEFAULT_WAKE_WORD,
+        help=f"设置唤醒词 (默认: {DEFAULT_WAKE_WORD})"
+    )
 
     args = parser.parse_args()
 
@@ -348,6 +501,9 @@ async def main():
         device_index=args.device,
         host=args.host,
         port=args.port,
+        enable_tts=not args.no_tts,
+        wake_word_enabled=not args.no_wake_word,
+        wake_word=args.wake_word,
     )
 
     if args.list_devices:

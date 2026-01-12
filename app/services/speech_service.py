@@ -6,10 +6,104 @@ from typing import AsyncGenerator, Callable, Optional
 
 import dashscope
 from dashscope.audio.asr import Recognition, RecognitionCallback, RecognitionResult
+from dashscope.audio.tts_v2 import SpeechSynthesizer, ResultCallback, AudioFormat
 from loguru import logger
 
 from app.core.config import settings
 from app.schemas.speech import SpeechToTextResponse, TextToSpeechResponse
+
+
+# TTS 配置
+TTS_MODEL = "cosyvoice-v3-flash"
+TTS_VOICE = "longxiaochun_v3"
+TTS_SAMPLE_RATE = 22050
+
+
+class RealtimeTTSCallback(ResultCallback):
+    """实时语音合成回调 - 将音频数据放入队列"""
+
+    def __init__(self, audio_queue: queue.Queue):
+        self.audio_queue = audio_queue
+        self.is_open = False
+        self.error_message: Optional[str] = None
+
+    def on_open(self):
+        logger.info("TTS WebSocket 连接已建立")
+        self.is_open = True
+
+    def on_complete(self):
+        logger.info("TTS 语音合成完成")
+        self.audio_queue.put(None)  # 结束信号
+
+    def on_error(self, message: str):
+        self.error_message = message
+        logger.error(f"TTS 语音合成错误: {message}")
+        self.audio_queue.put(None)
+
+    def on_close(self):
+        logger.info("TTS WebSocket 连接已关闭")
+        self.is_open = False
+
+    def on_event(self, message):
+        logger.debug(f"TTS 事件: {message}")
+
+    def on_data(self, data: bytes) -> None:
+        """接收到音频数据"""
+        self.audio_queue.put(data)
+
+
+class RealtimeTTSSynthesizer:
+    """实时语音合成器 - 流式接收 LLM 文本并合成语音"""
+
+    def __init__(
+        self,
+        model: str = TTS_MODEL,
+        voice: str = TTS_VOICE,
+    ):
+        self.model = model
+        self.voice = voice
+        self.audio_queue: queue.Queue = queue.Queue()
+        self.callback: Optional[RealtimeTTSCallback] = None
+        self.synthesizer: Optional[SpeechSynthesizer] = None
+
+        # 配置 DashScope
+        if not settings.dashscope_api_key:
+            raise ValueError("DASHSCOPE_API_KEY 未配置")
+
+        dashscope.api_key = settings.dashscope_api_key
+
+    def start(self) -> None:
+        """启动语音合成器"""
+        self.callback = RealtimeTTSCallback(self.audio_queue)
+
+        self.synthesizer = SpeechSynthesizer(
+            model=self.model,
+            voice=self.voice,
+            format=AudioFormat.PCM_22050HZ_MONO_16BIT,
+            callback=self.callback,
+        )
+        logger.info(f"TTS 合成器已启动 (模型: {self.model}, 声音: {self.voice})")
+
+    def send_text(self, text: str) -> None:
+        """发送文本进行合成 (流式)"""
+        if self.synthesizer and text:
+            self.synthesizer.streaming_call(text)
+
+    def complete(self) -> None:
+        """完成文本发送，等待合成结束"""
+        if self.synthesizer:
+            self.synthesizer.streaming_complete()
+            logger.info("TTS 合成完成")
+
+    def get_audio_queue(self) -> queue.Queue:
+        """获取音频数据队列"""
+        return self.audio_queue
+
+    def get_request_id(self) -> Optional[str]:
+        """获取请求 ID"""
+        if self.synthesizer:
+            return self.synthesizer.get_last_request_id()
+        return None
 
 
 class RealtimeRecognitionCallback(RecognitionCallback):
@@ -155,6 +249,17 @@ class SpeechService:
             on_result=on_result,
             sample_rate=sample_rate,
             audio_format=audio_format,
+        )
+
+    def create_realtime_tts(
+        self,
+        model: str = TTS_MODEL,
+        voice: str = TTS_VOICE,
+    ) -> RealtimeTTSSynthesizer:
+        """创建实时语音合成器"""
+        return RealtimeTTSSynthesizer(
+            model=model,
+            voice=voice,
         )
 
     async def speech_to_text(
