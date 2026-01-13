@@ -41,6 +41,9 @@ SYSTEM_PROMPT = """你是贾维斯，一个智能语音助手。请遵循以下�
 6. 控制回复长度，通常不超过3-4句话
 7. 使用自然、口语化的中文表达"""
 
+# 唤醒词确认回复
+WAKE_WORD_ACK = "收到"
+
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB
@@ -302,6 +305,38 @@ async def recognize_speech_stream(websocket: WebSocket):
                         tts_audio_task = None
 
                         try:
+                            # 先播放"收到"确认语音
+                            if enable_tts and wake_word_enabled:
+                                try:
+                                    ack_synthesizer = speech_service.create_realtime_tts(
+                                        model=DEFAULT_TTS_MODEL,
+                                        voice=tts_voice,
+                                    )
+                                    ack_synthesizer.start()
+                                    ack_synthesizer.send_text(WAKE_WORD_ACK)
+                                    ack_synthesizer.complete()
+
+                                    # 发送确认语音
+                                    ack_queue = ack_synthesizer.get_audio_queue()
+                                    while True:
+                                        try:
+                                            audio_data = await asyncio.get_event_loop().run_in_executor(
+                                                None, lambda: ack_queue.get(timeout=0.5)
+                                            )
+                                            if audio_data is None:
+                                                break
+                                            await websocket.send_json({
+                                                "type": "tts_audio",
+                                                "data": base64.b64encode(audio_data).decode("utf-8"),
+                                                "done": False,
+                                            })
+                                        except queue.Empty:
+                                            break
+
+                                    logger.info("已播放唤醒确认语音")
+                                except Exception as e:
+                                    logger.error(f"播放确认语音失败: {e}")
+
                             logger.info(f"调用大模型: {llm_model}, 联网搜索: {web_search}, TTS: {enable_tts}, 查询: {user_query[:50]}...")
                             await websocket.send_json({
                                 "type": "llm",
