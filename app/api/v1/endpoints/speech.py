@@ -172,7 +172,6 @@ async def recognize_speech_stream(websocket: WebSocket):
     wake_word_enabled = WAKE_WORD_ENABLED  # 是否启用唤醒词
     wake_word = WAKE_WORD  # 唤醒词
     is_activated = False  # 是否已被唤醒
-    accumulated_text = ""  # 累积的识别文本
     conversation_history: list = []  # 对话历史
 
     # 使用队列在线程间传递识别结果
@@ -218,7 +217,6 @@ async def recognize_speech_stream(websocket: WebSocket):
                     wake_word_enabled = message.get("wake_word_enabled", WAKE_WORD_ENABLED)
                     wake_word = message.get("wake_word", WAKE_WORD)
                     is_activated = not wake_word_enabled  # 如果禁用唤醒词，则直接激活
-                    accumulated_text = ""
 
                     # 创建实时识别器
                     try:
@@ -258,33 +256,32 @@ async def recognize_speech_stream(websocket: WebSocket):
                     logger.info(f"实时识别结束, 最终文本: {final_text}")
                     await websocket.send_json({"status": "stopped"})
 
-                    # 累积识别文本
-                    accumulated_text += final_text
-
                     # 唤醒词检测逻辑
+                    # 每次语音都需要包含唤醒词，唤醒词后面的内容作为用户查询
                     user_query = ""
                     if wake_word_enabled:
-                        if not is_activated:
-                            # 检查是否包含唤醒词
-                            if wake_word in accumulated_text:
-                                is_activated = True
-                                # 提取唤醒词后的内容
-                                wake_idx = accumulated_text.find(wake_word)
-                                user_query = accumulated_text[wake_idx + len(wake_word):].strip()
-                                logger.info(f"检测到唤醒词 '{wake_word}'，已激活")
+                        if wake_word in final_text:
+                            # 提取唤醒词后的内容作为用户查询
+                            wake_idx = final_text.find(wake_word)
+                            user_query = final_text[wake_idx + len(wake_word):].strip()
+                            if user_query:
+                                logger.info(f"检测到唤醒词 '{wake_word}'，用户指令: {user_query[:50]}...")
                                 await websocket.send_json({
                                     "type": "wake_word",
                                     "status": "activated",
                                     "wake_word": wake_word,
+                                    "query": user_query,
                                 })
-                                accumulated_text = ""  # 清空累积文本
                             else:
-                                logger.debug(f"等待唤醒词 '{wake_word}'...")
+                                logger.info(f"检测到唤醒词 '{wake_word}'，但没有后续指令")
+                                await websocket.send_json({
+                                    "type": "wake_word",
+                                    "status": "activated",
+                                    "wake_word": wake_word,
+                                    "message": "请在唤醒词后说出您的问题",
+                                })
                         else:
-                            # 已激活状态，直接使用识别结果
-                            user_query = final_text.strip()
-                            is_activated = False  # 处理完后重置激活状态
-                            accumulated_text = ""
+                            logger.debug(f"未检测到唤醒词 '{wake_word}'，忽略此次输入")
                     else:
                         # 未启用唤醒词，直接使用识别结果
                         user_query = final_text.strip()
