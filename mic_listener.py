@@ -391,16 +391,39 @@ class MicrophoneListener:
             return
 
         self.running = True
-        logger.info("开始监听麦克风... 按 Ctrl+C 停止")
+        logger.info("开始监听麦克风... 输入 'h' 查看帮助, Ctrl+C 停止")
 
-        # 并发运行发送和接收
+        # 并发运行发送、接收和键盘处理
         try:
             await asyncio.gather(
                 self.send_audio(),
                 self.receive_results(),
+                self.handle_keyboard(),
             )
         except asyncio.CancelledError:
             logger.info("任务已取消")
+
+    async def handle_keyboard(self) -> None:
+        """处理键盘输入"""
+        import sys
+        import select
+
+        while self.running:
+            try:
+                # 非阻塞检查标准输入
+                if sys.stdin in select.select([sys.stdin], [], [], 0.1)[0]:
+                    line = sys.stdin.readline().strip().lower()
+                    if line == "q" or line == "quit":
+                        self.running = False
+                        break
+                    elif line == "h" or line == "help":
+                        print("\n命令帮助:")
+                        print("  q/quit  - 退出程序")
+                        print("  h/help  - 显示帮助\n")
+                else:
+                    await asyncio.sleep(0.1)
+            except Exception:
+                await asyncio.sleep(0.1)
 
     async def stop(self) -> None:
         """停止监听"""

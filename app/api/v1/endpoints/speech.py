@@ -30,6 +30,17 @@ DEFAULT_TTS_VOICE = "longxiaochun_v3"
 WAKE_WORD = "贾维斯"
 WAKE_WORD_ENABLED = True  # 默认启用唤醒词
 
+# 语音助手系统提示词
+SYSTEM_PROMPT = """你是贾维斯，一个智能语音助手。请遵循以下原则：
+
+1. 回复要简洁明了，适合语音播报
+2. 避免使用 markdown 格式、代码块、列表符号等
+3. 不要使用表情符号
+4. 直接回答问题，不要过多寒暄
+5. 如果需要列举，用"第一、第二"等口语化方式
+6. 控制回复长度，通常不超过3-4句话
+7. 使用自然、口语化的中文表达"""
+
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB
@@ -172,7 +183,6 @@ async def recognize_speech_stream(websocket: WebSocket):
     wake_word_enabled = WAKE_WORD_ENABLED  # 是否启用唤醒词
     wake_word = WAKE_WORD  # 唤醒词
     is_activated = False  # 是否已被唤醒
-    conversation_history: list = []  # 对话历史
 
     # 使用队列在线程间传递识别结果
     result_queue: queue.Queue = queue.Queue()
@@ -344,13 +354,16 @@ async def recognize_speech_stream(websocket: WebSocket):
                                     logger.error(f"创建 TTS 合成器失败: {e}")
                                     tts_synthesizer = None
 
-                            # 添加用户消息到对话历史
-                            conversation_history.append(Message(role="user", content=user_query))
+                            # 构建消息列表 (每次请求独立，不保存历史)
+                            messages = [
+                                Message(role="system", content=SYSTEM_PROMPT),
+                                Message(role="user", content=user_query),
+                            ]
 
                             # 流式调用大模型
                             full_response = ""
                             async for chunk in chat_service.send_message_stream(
-                                messages=conversation_history,
+                                messages=messages,
                                 model=llm_model,
                                 web_search=web_search,
                             ):
@@ -372,9 +385,6 @@ async def recognize_speech_stream(websocket: WebSocket):
                                 if tts_audio_task:
                                     await tts_audio_task
 
-                            # 添加助手回复到对话历史
-                            conversation_history.append(Message(role="assistant", content=full_response))
-
                             await websocket.send_json({
                                 "type": "llm",
                                 "content": "",
@@ -392,11 +402,6 @@ async def recognize_speech_stream(websocket: WebSocket):
                             # 清理 TTS 资源
                             if tts_audio_task and not tts_audio_task.done():
                                 tts_audio_task.cancel()
-
-                elif action == "clear_history":
-                    # 清空对话历史
-                    conversation_history.clear()
-                    await websocket.send_json({"status": "history_cleared"})
 
             # 处理二进制数据 (音频流)
             elif "bytes" in data:
