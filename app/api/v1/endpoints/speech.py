@@ -42,7 +42,7 @@ SYSTEM_PROMPT = """你是贾维斯，一个智能语音助手。请遵循以下�
 7. 使用自然、口语化的中文表达"""
 
 # 唤醒词确认回复
-WAKE_WORD_ACK = "收到"
+WAKE_WORD_ACK = "收到 请稍等"
 
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
@@ -185,13 +185,184 @@ async def recognize_speech_stream(websocket: WebSocket):
     tts_voice = DEFAULT_TTS_VOICE  # TTS 声音
     wake_word_enabled = WAKE_WORD_ENABLED  # 是否启用唤醒词
     wake_word = WAKE_WORD  # 唤醒词
-    is_activated = False  # 是否已被唤醒
 
     # 使用队列在线程间传递识别结果
     result_queue: queue.Queue = queue.Queue()
 
+    async def handle_final_text(final_text: str):
+        """处理最终识别结果 - 唤醒词检测和大模型调用"""
+        nonlocal enable_llm, llm_model, web_search, enable_tts, tts_voice, wake_word_enabled, wake_word
+
+        # 唤醒词检测逻辑
+        user_query = ""
+        if wake_word_enabled:
+            if wake_word in final_text:
+                # 提取唤醒词后的内容作为用户查询
+                wake_idx = final_text.find(wake_word)
+                user_query = final_text[wake_idx + len(wake_word):].strip()
+                if user_query:
+                    logger.info(f"检测到唤醒词 '{wake_word}'，用户指令: {user_query[:50]}...")
+                    await websocket.send_json({
+                        "type": "wake_word",
+                        "status": "activated",
+                        "wake_word": wake_word,
+                        "query": user_query,
+                    })
+                else:
+                    logger.info(f"检测到唤醒词 '{wake_word}'，但没有后续指令")
+                    await websocket.send_json({
+                        "type": "wake_word",
+                        "status": "activated",
+                        "wake_word": wake_word,
+                        "message": "请在唤醒词后说出您的问题",
+                    })
+            else:
+                logger.debug(f"未检测到唤醒词 '{wake_word}'，忽略此次输入")
+        else:
+            # 未启用唤醒词，直接使用识别结果
+            user_query = final_text.strip()
+
+        # 如果启用了大模型且有用户查询，调用大模型
+        if enable_llm and user_query:
+            tts_synthesizer = None
+            tts_audio_task = None
+
+            try:
+                # 先播放"收到"确认语音
+                if enable_tts and wake_word_enabled:
+                    try:
+                        ack_synthesizer = speech_service.create_realtime_tts(
+                            model=DEFAULT_TTS_MODEL,
+                            voice=tts_voice,
+                        )
+                        ack_synthesizer.start()
+                        ack_synthesizer.send_text(WAKE_WORD_ACK)
+                        ack_synthesizer.complete()
+
+                        # 发送确认语音
+                        ack_queue = ack_synthesizer.get_audio_queue()
+                        while True:
+                            try:
+                                audio_data = await asyncio.get_event_loop().run_in_executor(
+                                    None, lambda: ack_queue.get(timeout=0.5)
+                                )
+                                if audio_data is None:
+                                    break
+                                await websocket.send_json({
+                                    "type": "tts_audio",
+                                    "data": base64.b64encode(audio_data).decode("utf-8"),
+                                    "done": False,
+                                })
+                            except queue.Empty:
+                                break
+
+                        logger.info("已播放唤醒确认语音")
+                    except Exception as e:
+                        logger.error(f"播放确认语音失败: {e}")
+
+                logger.info(f"调用大模型: {llm_model}, 联网搜索: {web_search}, TTS: {enable_tts}, 查询: {user_query[:50]}...")
+                await websocket.send_json({
+                    "type": "llm",
+                    "status": "thinking",
+                    "query": user_query,
+                })
+
+                # 如果启用 TTS，创建语音合成器
+                if enable_tts:
+                    try:
+                        tts_synthesizer = speech_service.create_realtime_tts(
+                            model=DEFAULT_TTS_MODEL,
+                            voice=tts_voice,
+                        )
+                        tts_synthesizer.start()
+
+                        # 启动音频发送任务
+                        async def send_tts_audio():
+                            """从 TTS 队列读取音频并发送给客户端"""
+                            audio_queue = tts_synthesizer.get_audio_queue()
+                            while True:
+                                try:
+                                    audio_data = await asyncio.get_event_loop().run_in_executor(
+                                        None, lambda: audio_queue.get(timeout=0.1)
+                                    )
+                                    if audio_data is None:  # 结束信号
+                                        break
+                                    # 发送音频数据给客户端
+                                    await websocket.send_json({
+                                        "type": "tts_audio",
+                                        "data": base64.b64encode(audio_data).decode("utf-8"),
+                                        "done": False,
+                                    })
+                                except queue.Empty:
+                                    await asyncio.sleep(0.01)
+                                except Exception as e:
+                                    logger.error(f"发送 TTS 音频失败: {e}")
+                                    break
+
+                            # 发送音频完成信号
+                            await websocket.send_json({
+                                "type": "tts_audio",
+                                "done": True,
+                            })
+
+                        tts_audio_task = asyncio.create_task(send_tts_audio())
+                        logger.info(f"TTS 合成器已启动 (声音: {tts_voice})")
+
+                    except Exception as e:
+                        logger.error(f"创建 TTS 合成器失败: {e}")
+                        tts_synthesizer = None
+
+                # 构建消息列表 (每次请求独立，不保存历史)
+                messages = [
+                    Message(role="system", content=SYSTEM_PROMPT),
+                    Message(role="user", content=user_query),
+                ]
+
+                # 流式调用大模型
+                full_response = ""
+                async for chunk in chat_service.send_message_stream(
+                    messages=messages,
+                    model=llm_model,
+                    web_search=web_search,
+                ):
+                    full_response += chunk
+                    await websocket.send_json({
+                        "type": "llm",
+                        "content": chunk,
+                        "done": False,
+                    })
+
+                    # 同时发送给 TTS 合成器
+                    if tts_synthesizer:
+                        tts_synthesizer.send_text(chunk)
+
+                # 完成 TTS 合成
+                if tts_synthesizer:
+                    tts_synthesizer.complete()
+                    # 等待音频发送完成
+                    if tts_audio_task:
+                        await tts_audio_task
+
+                await websocket.send_json({
+                    "type": "llm",
+                    "content": "",
+                    "done": True,
+                    "full_response": full_response,
+                })
+                logger.info(f"大模型回复完成: {full_response[:100]}...")
+
+            except Exception as e:
+                logger.error(f"大模型调用失败: {e}")
+                await websocket.send_json({
+                    "type": "llm",
+                    "error": str(e),
+                })
+                # 清理 TTS 资源
+                if tts_audio_task and not tts_audio_task.done():
+                    tts_audio_task.cancel()
+
     async def process_results():
-        """从队列中读取结果并发送给客户端"""
+        """从队列中读取结果并发送给客户端，处理最终识别结果"""
         while True:
             try:
                 # 非阻塞方式检查队列
@@ -200,11 +371,18 @@ async def recognize_speech_stream(websocket: WebSocket):
                 )
                 if result is None:  # 停止信号
                     break
+
+                # 发送识别结果给客户端
                 await websocket.send_json(result)
+
+                # 如果是最终结果，处理唤醒词和大模型调用
+                if result.get("is_final") and result.get("text"):
+                    await handle_final_text(result["text"])
+
             except queue.Empty:
                 await asyncio.sleep(0.01)
             except Exception as e:
-                logger.error(f"发送结果失败: {e}")
+                logger.error(f"处理结果失败: {e}")
                 break
 
     # 启动结果处理任务
@@ -229,7 +407,6 @@ async def recognize_speech_stream(websocket: WebSocket):
                     tts_voice = message.get("tts_voice", DEFAULT_TTS_VOICE)
                     wake_word_enabled = message.get("wake_word_enabled", WAKE_WORD_ENABLED)
                     wake_word = message.get("wake_word", WAKE_WORD)
-                    is_activated = not wake_word_enabled  # 如果禁用唤醒词，则直接激活
 
                     # 创建实时识别器
                     try:
@@ -255,188 +432,13 @@ async def recognize_speech_stream(websocket: WebSocket):
                         await websocket.send_json({"error": str(e)})
 
                 elif action == "stop":
-                    final_text = ""
+                    # 停止识别器 (最终结果已通过 process_results 处理)
                     if recognizer:
-                        final_text = recognizer.stop() or ""
-                        if final_text:
-                            await websocket.send_json({
-                                "type": "recognition",
-                                "text": final_text,
-                                "is_final": True,
-                            })
+                        recognizer.stop()
                         recognizer = None
 
-                    logger.info(f"实时识别结束, 最终文本: {final_text}")
+                    logger.info("实时识别已停止")
                     await websocket.send_json({"status": "stopped"})
-
-                    # 唤醒词检测逻辑
-                    # 每次语音都需要包含唤醒词，唤醒词后面的内容作为用户查询
-                    user_query = ""
-                    if wake_word_enabled:
-                        if wake_word in final_text:
-                            # 提取唤醒词后的内容作为用户查询
-                            wake_idx = final_text.find(wake_word)
-                            user_query = final_text[wake_idx + len(wake_word):].strip()
-                            if user_query:
-                                logger.info(f"检测到唤醒词 '{wake_word}'，用户指令: {user_query[:50]}...")
-                                await websocket.send_json({
-                                    "type": "wake_word",
-                                    "status": "activated",
-                                    "wake_word": wake_word,
-                                    "query": user_query,
-                                })
-                            else:
-                                logger.info(f"检测到唤醒词 '{wake_word}'，但没有后续指令")
-                                await websocket.send_json({
-                                    "type": "wake_word",
-                                    "status": "activated",
-                                    "wake_word": wake_word,
-                                    "message": "请在唤醒词后说出您的问题",
-                                })
-                        else:
-                            logger.debug(f"未检测到唤醒词 '{wake_word}'，忽略此次输入")
-                    else:
-                        # 未启用唤醒词，直接使用识别结果
-                        user_query = final_text.strip()
-
-                    # 如果启用了大模型且有用户查询，调用大模型
-                    if enable_llm and user_query:
-                        tts_synthesizer = None
-                        tts_audio_task = None
-
-                        try:
-                            # 先播放"收到"确认语音
-                            if enable_tts and wake_word_enabled:
-                                try:
-                                    ack_synthesizer = speech_service.create_realtime_tts(
-                                        model=DEFAULT_TTS_MODEL,
-                                        voice=tts_voice,
-                                    )
-                                    ack_synthesizer.start()
-                                    ack_synthesizer.send_text(WAKE_WORD_ACK)
-                                    ack_synthesizer.complete()
-
-                                    # 发送确认语音
-                                    ack_queue = ack_synthesizer.get_audio_queue()
-                                    while True:
-                                        try:
-                                            audio_data = await asyncio.get_event_loop().run_in_executor(
-                                                None, lambda: ack_queue.get(timeout=0.5)
-                                            )
-                                            if audio_data is None:
-                                                break
-                                            await websocket.send_json({
-                                                "type": "tts_audio",
-                                                "data": base64.b64encode(audio_data).decode("utf-8"),
-                                                "done": False,
-                                            })
-                                        except queue.Empty:
-                                            break
-
-                                    logger.info("已播放唤醒确认语音")
-                                except Exception as e:
-                                    logger.error(f"播放确认语音失败: {e}")
-
-                            logger.info(f"调用大模型: {llm_model}, 联网搜索: {web_search}, TTS: {enable_tts}, 查询: {user_query[:50]}...")
-                            await websocket.send_json({
-                                "type": "llm",
-                                "status": "thinking",
-                                "query": user_query,
-                            })
-
-                            # 如果启用 TTS，创建语音合成器
-                            if enable_tts:
-                                try:
-                                    tts_synthesizer = speech_service.create_realtime_tts(
-                                        model=DEFAULT_TTS_MODEL,
-                                        voice=tts_voice,
-                                    )
-                                    tts_synthesizer.start()
-
-                                    # 启动音频发送任务
-                                    async def send_tts_audio():
-                                        """从 TTS 队列读取音频并发送给客户端"""
-                                        audio_queue = tts_synthesizer.get_audio_queue()
-                                        while True:
-                                            try:
-                                                audio_data = await asyncio.get_event_loop().run_in_executor(
-                                                    None, lambda: audio_queue.get(timeout=0.1)
-                                                )
-                                                if audio_data is None:  # 结束信号
-                                                    break
-                                                # 发送音频数据给客户端
-                                                await websocket.send_json({
-                                                    "type": "tts_audio",
-                                                    "data": base64.b64encode(audio_data).decode("utf-8"),
-                                                    "done": False,
-                                                })
-                                            except queue.Empty:
-                                                await asyncio.sleep(0.01)
-                                            except Exception as e:
-                                                logger.error(f"发送 TTS 音频失败: {e}")
-                                                break
-
-                                        # 发送音频完成信号
-                                        await websocket.send_json({
-                                            "type": "tts_audio",
-                                            "done": True,
-                                        })
-
-                                    tts_audio_task = asyncio.create_task(send_tts_audio())
-                                    logger.info(f"TTS 合成器已启动 (声音: {tts_voice})")
-
-                                except Exception as e:
-                                    logger.error(f"创建 TTS 合成器失败: {e}")
-                                    tts_synthesizer = None
-
-                            # 构建消息列表 (每次请求独立，不保存历史)
-                            messages = [
-                                Message(role="system", content=SYSTEM_PROMPT),
-                                Message(role="user", content=user_query),
-                            ]
-
-                            # 流式调用大模型
-                            full_response = ""
-                            async for chunk in chat_service.send_message_stream(
-                                messages=messages,
-                                model=llm_model,
-                                web_search=web_search,
-                            ):
-                                full_response += chunk
-                                await websocket.send_json({
-                                    "type": "llm",
-                                    "content": chunk,
-                                    "done": False,
-                                })
-
-                                # 同时发送给 TTS 合成器
-                                if tts_synthesizer:
-                                    tts_synthesizer.send_text(chunk)
-
-                            # 完成 TTS 合成
-                            if tts_synthesizer:
-                                tts_synthesizer.complete()
-                                # 等待音频发送完成
-                                if tts_audio_task:
-                                    await tts_audio_task
-
-                            await websocket.send_json({
-                                "type": "llm",
-                                "content": "",
-                                "done": True,
-                                "full_response": full_response,
-                            })
-                            logger.info(f"大模型回复完成: {full_response[:100]}...")
-
-                        except Exception as e:
-                            logger.error(f"大模型调用失败: {e}")
-                            await websocket.send_json({
-                                "type": "llm",
-                                "error": str(e),
-                            })
-                            # 清理 TTS 资源
-                            if tts_audio_task and not tts_audio_task.done():
-                                tts_audio_task.cancel()
 
             # 处理二进制数据 (音频流)
             elif "bytes" in data:
