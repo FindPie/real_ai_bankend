@@ -1,5 +1,6 @@
 import base64
-from typing import Optional
+import difflib
+from typing import List, Optional, Tuple
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
@@ -29,6 +30,15 @@ DEFAULT_TTS_VOICE = "longxiaochun_v3"
 # 唤醒词配置
 WAKE_WORD = "贾维斯"
 WAKE_WORD_ENABLED = True  # 默认启用唤醒词
+# 唤醒词变体 (常见的语音识别误差)
+WAKE_WORD_VARIANTS = [
+    "贾维斯", "加维斯", "贾威斯", "加威斯",
+    "嘉维斯", "嘉威斯", "佳维斯", "佳威斯",
+    "贾维丝", "加维丝", "贾卫斯", "加卫斯",
+    "jarvis", "javis", "驾维斯",
+]
+# 模糊匹配阈值 (0.0-1.0, 越高越严格)
+WAKE_WORD_MATCH_THRESHOLD = 0.6
 
 # 语音助手系统提示词
 SYSTEM_PROMPT = """你是贾维斯，一个智能语音助手。请遵循以下原则：
@@ -47,6 +57,60 @@ WAKE_WORD_ACK = "收到 请稍等"
 # 支持的音频格式
 SUPPORTED_AUDIO_FORMATS = {"pcm", "wav", "mp3", "m4a", "webm", "ogg", "flac", "amr"}
 MAX_AUDIO_SIZE = 10 * 1024 * 1024  # 10MB
+
+
+def find_wake_word(text: str, variants: List[str] = WAKE_WORD_VARIANTS, threshold: float = WAKE_WORD_MATCH_THRESHOLD) -> Tuple[bool, int, str]:
+    """
+    在文本中查找唤醒词（支持模糊匹配）
+
+    Args:
+        text: 要搜索的文本
+        variants: 唤醒词变体列表
+        threshold: 模糊匹配阈值
+
+    Returns:
+        (是否找到, 唤醒词结束位置, 匹配到的唤醒词)
+    """
+    text_lower = text.lower()
+
+    # 1. 精确匹配：先检查是否完全包含某个变体
+    for variant in variants:
+        variant_lower = variant.lower()
+        idx = text_lower.find(variant_lower)
+        if idx != -1:
+            end_pos = idx + len(variant)
+            logger.debug(f"唤醒词精确匹配: '{variant}' at position {idx}")
+            return True, end_pos, variant
+
+    # 2. 模糊匹配：使用滑动窗口检测相似词
+    # 唤醒词通常是2-4个字，我们检查文本中每个可能的位置
+    min_len = min(len(v) for v in variants)
+    max_len = max(len(v) for v in variants)
+
+    best_match = None
+    best_ratio = 0.0
+    best_end_pos = 0
+
+    for window_size in range(min_len, max_len + 1):
+        for i in range(len(text) - window_size + 1):
+            window = text[i:i + window_size]
+            window_lower = window.lower()
+
+            for variant in variants:
+                variant_lower = variant.lower()
+                # 计算相似度
+                ratio = difflib.SequenceMatcher(None, window_lower, variant_lower).ratio()
+
+                if ratio > best_ratio and ratio >= threshold:
+                    best_ratio = ratio
+                    best_match = window
+                    best_end_pos = i + window_size
+
+    if best_match:
+        logger.info(f"唤醒词模糊匹配: '{best_match}' (相似度: {best_ratio:.2f})")
+        return True, best_end_pos, best_match
+
+    return False, 0, ""
 
 
 @router.post(
@@ -193,31 +257,33 @@ async def recognize_speech_stream(websocket: WebSocket):
         """处理最终识别结果 - 唤醒词检测和大模型调用"""
         nonlocal enable_llm, llm_model, web_search, enable_tts, tts_voice, wake_word_enabled, wake_word
 
-        # 唤醒词检测逻辑
+        # 唤醒词检测逻辑 (支持模糊匹配)
         user_query = ""
         if wake_word_enabled:
-            if wake_word in final_text:
+            # 使用模糊匹配查找唤醒词
+            found, end_pos, matched_word = find_wake_word(final_text)
+
+            if found:
                 # 提取唤醒词后的内容作为用户查询
-                wake_idx = final_text.find(wake_word)
-                user_query = final_text[wake_idx + len(wake_word):].strip()
+                user_query = final_text[end_pos:].strip()
                 if user_query:
-                    logger.info(f"检测到唤醒词 '{wake_word}'，用户指令: {user_query[:50]}...")
+                    logger.info(f"检测到唤醒词 '{matched_word}'，用户指令: {user_query[:50]}...")
                     await websocket.send_json({
                         "type": "wake_word",
                         "status": "activated",
-                        "wake_word": wake_word,
+                        "wake_word": matched_word,
                         "query": user_query,
                     })
                 else:
-                    logger.info(f"检测到唤醒词 '{wake_word}'，但没有后续指令")
+                    logger.info(f"检测到唤醒词 '{matched_word}'，但没有后续指令")
                     await websocket.send_json({
                         "type": "wake_word",
                         "status": "activated",
-                        "wake_word": wake_word,
+                        "wake_word": matched_word,
                         "message": "请在唤醒词后说出您的问题",
                     })
             else:
-                logger.debug(f"未检测到唤醒词 '{wake_word}'，忽略此次输入")
+                logger.debug(f"未检测到唤醒词，忽略此次输入: {final_text[:30]}...")
         else:
             # 未启用唤醒词，直接使用识别结果
             user_query = final_text.strip()
