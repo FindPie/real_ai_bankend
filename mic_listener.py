@@ -54,7 +54,7 @@ DEFAULT_PORT = 8000
 WS_PATH = "/api/v1/speech/recognize/stream"
 
 # TTS 播放配置
-TTS_SAMPLE_RATE = 22050  # TTS 输出采样率 (与服务端一致)
+TTS_SAMPLE_RATE = 48000  # TTS 输出采样率 (与服务端一致)
 TTS_CHANNELS = 1
 TTS_FORMAT = pyaudio.paInt16
 
@@ -256,8 +256,15 @@ class MicrophoneListener:
 
                     msg_type = data.get("type", "")
 
+                    # TTS 准备信号
+                    if msg_type == "tts_prepare":
+                        logger.debug("[TTS] 准备播放音频")
+                        # 启动音频播放器
+                        if self.enable_tts and self.audio_player:
+                            self.audio_player.start()
+
                     # 语音识别结果
-                    if msg_type == "recognition":
+                    elif msg_type == "recognition":
                         text = data.get("text", "")
                         is_final = data.get("is_final", False)
 

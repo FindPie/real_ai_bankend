@@ -297,6 +297,12 @@ async def recognize_speech_stream(websocket: WebSocket):
                 # 先播放"收到"确认语音
                 if enable_tts and wake_word_enabled:
                     try:
+                        # 先发送准备信号，让客户端启动播放器
+                        await websocket.send_json({
+                            "type": "tts_prepare",
+                            "message": "准备播放唤醒确认语音",
+                        })
+
                         ack_synthesizer = speech_service.create_realtime_tts(
                             model=DEFAULT_TTS_MODEL,
                             voice=tts_voice,
@@ -321,6 +327,12 @@ async def recognize_speech_stream(websocket: WebSocket):
                                 })
                             except queue.Empty:
                                 break
+
+                        # 发送完成信号
+                        await websocket.send_json({
+                            "type": "tts_audio",
+                            "done": True,
+                        })
 
                         logger.info("已播放唤醒确认语音")
                     except Exception as e:

@@ -16,7 +16,7 @@ from app.schemas.speech import SpeechToTextResponse, TextToSpeechResponse
 # TTS 配置
 TTS_MODEL = "cosyvoice-v3-flash"
 TTS_VOICE = "longxiaochun_v3"
-TTS_SAMPLE_RATE = 22050
+TTS_SAMPLE_RATE = 48000
 
 
 class RealtimeTTSCallback(ResultCallback):
@@ -79,7 +79,7 @@ class RealtimeTTSSynthesizer:
         self.synthesizer = SpeechSynthesizer(
             model=self.model,
             voice=self.voice,
-            format=AudioFormat.PCM_22050HZ_MONO_16BIT,
+            format=AudioFormat.PCM_48000HZ_MONO_16BIT,
             callback=self.callback,
         )
         logger.info(f"TTS 合成器已启动 (模型: {self.model}, 声音: {self.voice})")
