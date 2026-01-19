@@ -369,20 +369,15 @@ class MicrophoneListener:
         try:
             while self.running and self.stream and self.websocket:
                 try:
-                    # 检查是否正在播放TTS音频
-                    if self.audio_player and self.audio_player.is_playing:
-                        # 播放期间，仍然读取音频但不发送，避免缓冲区溢出
-                        self.stream.read(CHUNK, exception_on_overflow=False)
-                        await asyncio.sleep(0.01)
-                        continue
-
                     # 读取音频数据 (48kHz)
                     data = self.stream.read(CHUNK, exception_on_overflow=False)
 
                     # 重采样到 16kHz
                     resampled_data = resample_audio(data, RESAMPLE_RATIO)
 
-                    # 发送重采样后的数据
+                    # 始终发送音频数据，即使在播放期间
+                    # 这样可以检测唤醒词并打断播放
+                    # 注意：播放期间会有短暂的回声，直到检测到唤醒词并中断
                     await self.websocket.send(resampled_data)
                     await asyncio.sleep(0.01)  # 小延迟避免过载
 
