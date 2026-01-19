@@ -258,49 +258,100 @@ async def recognize_speech_stream(websocket: WebSocket):
     current_tts_task: Optional[asyncio.Task] = None
     current_tts_synthesizer = None
 
+    # 唤醒词状态跟踪
+    wake_word_detected = False  # 是否已检测到唤醒词
+    waiting_for_query = False  # 是否正在等待用户输入问题
+    accumulated_text = ""  # 累积的识别文本
+
     async def handle_final_text(final_text: str):
         """处理最终识别结果 - 唤醒词检测和大模型调用"""
         nonlocal enable_llm, llm_model, web_search, enable_tts, tts_voice, wake_word_enabled, wake_word
         nonlocal current_tts_task, current_tts_synthesizer
+        nonlocal wake_word_detected, waiting_for_query, accumulated_text
 
-        # 唤醒词检测逻辑 (支持模糊匹配)
+        # 唤醒词检测逻辑 (支持模糊匹配和累积识别)
         user_query = ""
         if wake_word_enabled:
-            # 使用模糊匹配查找唤醒词
-            found, end_pos, matched_word = find_wake_word(final_text)
+            # 如果正在等待用户输入，累积当前识别结果
+            if waiting_for_query:
+                accumulated_text += " " + final_text.strip()
+                logger.info(f"累积识别文本: {accumulated_text}")
 
-            if found:
-                # 如果检测到唤醒词，先取消之前正在进行的TTS任务
-                if current_tts_task and not current_tts_task.done():
-                    logger.info("检测到新的唤醒词，取消之前的TTS任务")
-                    current_tts_task.cancel()
-                    # 发送停止信号给客户端
-                    await websocket.send_json({
-                        "type": "tts_audio",
-                        "done": True,
-                        "interrupted": True,
-                    })
-
-                # 提取唤醒词后的内容作为用户查询
-                user_query = final_text[end_pos:].strip()
-                if user_query:
-                    logger.info(f"检测到唤醒词 '{matched_word}'，用户指令: {user_query[:50]}...")
-                    await websocket.send_json({
-                        "type": "wake_word",
-                        "status": "activated",
-                        "wake_word": matched_word,
-                        "query": user_query,
-                    })
+                # 检查累积文本中是否有实际内容（不只是唤醒词）
+                found, end_pos, matched_word = find_wake_word(accumulated_text)
+                if found:
+                    user_query = accumulated_text[end_pos:].strip()
+                    if user_query:
+                        # 有实际问题了，处理它
+                        logger.info(f"收到用户问题: {user_query[:50]}...")
+                        waiting_for_query = False
+                        accumulated_text = ""
+                        await websocket.send_json({
+                            "type": "wake_word",
+                            "status": "query_received",
+                            "query": user_query,
+                        })
+                    else:
+                        # 还是只有唤醒词，继续等待
+                        logger.debug("仍在等待用户输入问题...")
+                        return
                 else:
-                    logger.info(f"检测到唤醒词 '{matched_word}'，但没有后续指令")
-                    await websocket.send_json({
-                        "type": "wake_word",
-                        "status": "activated",
-                        "wake_word": matched_word,
-                        "message": "请在唤醒词后说出您的问题",
-                    })
+                    # 累积文本中没有唤醒词了，直接作为问题
+                    user_query = accumulated_text.strip()
+                    if user_query:
+                        logger.info(f"收到用户问题（无唤醒词）: {user_query[:50]}...")
+                        waiting_for_query = False
+                        accumulated_text = ""
+                        await websocket.send_json({
+                            "type": "wake_word",
+                            "status": "query_received",
+                            "query": user_query,
+                        })
+                    else:
+                        return
             else:
-                logger.debug(f"未检测到唤醒词，忽略此次输入: {final_text[:30]}...")
+                # 首次检测唤醒词
+                found, end_pos, matched_word = find_wake_word(final_text)
+
+                if found:
+                    # 如果检测到唤醒词，先取消之前正在进行的TTS任务
+                    if current_tts_task and not current_tts_task.done():
+                        logger.info("检测到新的唤醒词，取消之前的TTS任务")
+                        current_tts_task.cancel()
+                        # 发送停止信号给客户端
+                        await websocket.send_json({
+                            "type": "tts_audio",
+                            "done": True,
+                            "interrupted": True,
+                        })
+
+                    # 提取唤醒词后的内容作为用户查询
+                    user_query = final_text[end_pos:].strip()
+                    if user_query:
+                        logger.info(f"检测到唤醒词 '{matched_word}'，用户指令: {user_query[:50]}...")
+                        wake_word_detected = True
+                        await websocket.send_json({
+                            "type": "wake_word",
+                            "status": "activated",
+                            "wake_word": matched_word,
+                            "query": user_query,
+                        })
+                    else:
+                        logger.info(f"检测到唤醒词 '{matched_word}'，等待用户输入问题...")
+                        wake_word_detected = True
+                        waiting_for_query = True
+                        accumulated_text = final_text.strip()
+                        await websocket.send_json({
+                            "type": "wake_word",
+                            "status": "activated",
+                            "wake_word": matched_word,
+                            "message": "在呢，您说",
+                        })
+                        # 不处理，继续等待下一句
+                        return
+                else:
+                    logger.debug(f"未检测到唤醒词，忽略此次输入: {final_text[:30]}...")
+                    return
         else:
             # 未启用唤醒词，直接使用识别结果
             user_query = final_text.strip()
