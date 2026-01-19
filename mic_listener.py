@@ -72,6 +72,7 @@ class AudioPlayer:
         self.audio_queue: queue.Queue = queue.Queue()
         self.running = False
         self._play_thread: Optional[threading.Thread] = None
+        self.is_playing = False  # 标记是否正在播放
 
     def start(self) -> None:
         """启动播放器"""
@@ -98,17 +99,24 @@ class AudioPlayer:
 
     def _play_loop(self) -> None:
         """播放循环 (在单独线程中运行)"""
+        import time
         while self.running:
             try:
                 audio_data = self.audio_queue.get(timeout=0.1)
                 if audio_data is None:  # 停止信号
                     break
                 if self.stream:
+                    self.is_playing = True  # 标记正在播放
                     self.stream.write(audio_data)
             except queue.Empty:
+                if self.is_playing:
+                    # 播放完成后延迟200ms再恢复监听，避免残余回声
+                    time.sleep(0.2)
+                    self.is_playing = False  # 队列空，播放完成
                 continue
             except Exception as e:
                 logger.error(f"播放音频时出错: {e}")
+                self.is_playing = False
 
     def play(self, audio_data: bytes) -> None:
         """将音频数据加入播放队列"""
@@ -118,6 +126,7 @@ class AudioPlayer:
     def stop(self) -> None:
         """停止播放器"""
         self.running = False
+        self.is_playing = False
         self.audio_queue.put(None)  # 发送停止信号
 
         if self._play_thread:
@@ -336,6 +345,13 @@ class MicrophoneListener:
         try:
             while self.running and self.stream and self.websocket:
                 try:
+                    # 检查是否正在播放TTS音频
+                    if self.audio_player and self.audio_player.is_playing:
+                        # 播放期间，仍然读取音频但不发送，避免缓冲区溢出
+                        self.stream.read(CHUNK, exception_on_overflow=False)
+                        await asyncio.sleep(0.01)
+                        continue
+
                     # 读取音频数据 (48kHz)
                     data = self.stream.read(CHUNK, exception_on_overflow=False)
 
