@@ -175,11 +175,13 @@ class RealtimeRecognizer:
             sample_rate=self.sample_rate,
             semantic_punctuation_enabled=False,
             callback=self.callback,
+            # 设置句子间最大静音时长(毫秒)，默认800ms，增加到1500ms让用户有更多时间说话
+            max_sentence_silence=1500,
         )
 
         self.recognition.start()
         logger.info(
-            f"实时语音识别已启动 (采样率: {self.sample_rate}, 格式: {self.audio_format})"
+            f"实时语音识别已启动 (采样率: {self.sample_rate}, 格式: {self.audio_format}, 最大静音: 1500ms)"
         )
 
     def send_audio(self, audio_data: bytes) -> None:
