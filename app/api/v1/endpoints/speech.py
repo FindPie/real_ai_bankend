@@ -75,7 +75,7 @@ def find_wake_word(text: str, variants: List[str] = WAKE_WORD_VARIANTS, threshol
     text_lower = text.lower()
 
     # 1. 精确匹配：先检查是否完全包含某个变体
-    for variant in variants:
+    for variant in variants: 
         variant_lower = variant.lower()
         idx = text_lower.find(variant_lower)
         if idx != -1:
@@ -254,9 +254,14 @@ async def recognize_speech_stream(websocket: WebSocket):
     # 使用队列在线程间传递识别结果
     result_queue: queue.Queue = queue.Queue()
 
+    # 当前正在运行的TTS任务
+    current_tts_task: Optional[asyncio.Task] = None
+    current_tts_synthesizer = None
+
     async def handle_final_text(final_text: str):
         """处理最终识别结果 - 唤醒词检测和大模型调用"""
         nonlocal enable_llm, llm_model, web_search, enable_tts, tts_voice, wake_word_enabled, wake_word
+        nonlocal current_tts_task, current_tts_synthesizer
 
         # 唤醒词检测逻辑 (支持模糊匹配)
         user_query = ""
@@ -265,6 +270,17 @@ async def recognize_speech_stream(websocket: WebSocket):
             found, end_pos, matched_word = find_wake_word(final_text)
 
             if found:
+                # 如果检测到唤醒词，先取消之前正在进行的TTS任务
+                if current_tts_task and not current_tts_task.done():
+                    logger.info("检测到新的唤醒词，取消之前的TTS任务")
+                    current_tts_task.cancel()
+                    # 发送停止信号给客户端
+                    await websocket.send_json({
+                        "type": "tts_audio",
+                        "done": True,
+                        "interrupted": True,
+                    })
+
                 # 提取唤醒词后的内容作为用户查询
                 user_query = final_text[end_pos:].strip()
                 if user_query:
@@ -385,6 +401,9 @@ async def recognize_speech_stream(websocket: WebSocket):
                             })
 
                         tts_audio_task = asyncio.create_task(send_tts_audio())
+                        # 保存当前TTS任务引用，以便后续可以取消
+                        current_tts_task = tts_audio_task
+                        current_tts_synthesizer = tts_synthesizer
                         logger.info(f"TTS 合成器已启动 (声音: {tts_voice})")
 
                     except Exception as e:

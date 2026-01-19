@@ -123,6 +123,26 @@ class AudioPlayer:
         if self.running:
             self.audio_queue.put(audio_data)
 
+    def interrupt(self) -> None:
+        """中断当前播放（清空队列但不停止播放器）"""
+        # 清空队列中的所有待播放音频
+        while not self.audio_queue.empty():
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        # 停止播放并清除状态
+        if self.stream:
+            try:
+                self.stream.stop_stream()
+                self.stream.start_stream()  # 重新启动流
+            except Exception as e:
+                logger.warning(f"中断播放时出错: {e}")
+
+        self.is_playing = False
+        logger.info("TTS播放已被中断")
+
     def stop(self) -> None:
         """停止播放器"""
         self.running = False
@@ -318,6 +338,10 @@ class MicrophoneListener:
                         if data.get("status") == "activated":
                             wake_word = data.get("wake_word", "")
                             logger.success(f"[唤醒词] 检测到 '{wake_word}'，已激活!")
+                            # 如果正在播放TTS，立即中断
+                            if self.audio_player and self.audio_player.is_playing:
+                                self.audio_player.interrupt()
+                                logger.info("[唤醒词] 已中断正在播放的语音")
 
                     elif "error" in data:
                         logger.error(f"错误: {data['error']}")
