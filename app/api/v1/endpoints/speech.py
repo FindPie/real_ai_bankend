@@ -336,6 +336,7 @@ async def recognize_speech_stream(websocket: WebSocket):
                             "wake_word": matched_word,
                             "query": user_query,
                         })
+                        # 继续执行，处理用户问题
                     else:
                         logger.info(f"检测到唤醒词 '{matched_word}'，等待用户输入问题...")
                         wake_word_detected = True
@@ -351,6 +352,7 @@ async def recognize_speech_stream(websocket: WebSocket):
                         return
                 else:
                     logger.debug(f"未检测到唤醒词，忽略此次输入: {final_text[:30]}...")
+                    # 未检测到唤醒词，直接返回
                     return
         else:
             # 未启用唤醒词，直接使用识别结果
