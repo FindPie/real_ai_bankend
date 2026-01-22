@@ -29,6 +29,8 @@ from typing import Optional
 
 import pyaudio
 import websockets
+import numpy as np
+from collections import deque
 from loguru import logger
 
 # 音频配置
@@ -66,13 +68,14 @@ DEFAULT_WAKE_WORD_ENABLED = True
 class AudioPlayer:
     """音频播放器 - 用于播放 TTS 合成的语音"""
 
-    def __init__(self, audio: pyaudio.PyAudio):
+    def __init__(self, audio: pyaudio.PyAudio, echo_canceller: Optional['EchoCanceller'] = None):
         self.audio = audio
         self.stream: Optional[pyaudio.Stream] = None
         self.audio_queue: queue.Queue = queue.Queue()
         self.running = False
         self._play_thread: Optional[threading.Thread] = None
         self.is_playing = False  # 标记是否正在播放
+        self.echo_canceller = echo_canceller  # 回声消除器引用
 
     def start(self) -> None:
         """启动播放器"""
@@ -108,6 +111,11 @@ class AudioPlayer:
                 if self.stream:
                     self.is_playing = True  # 标记正在播放
                     self.stream.write(audio_data)
+
+                    # 将播放的音频添加到回声消除器缓冲区
+                    if self.echo_canceller:
+                        self.echo_canceller.add_playback_frame(audio_data)
+
             except queue.Empty:
                 if self.is_playing:
                     # 播放完成后延迟200ms再恢复监听，避免残余回声
@@ -171,6 +179,103 @@ class AudioPlayer:
         logger.info("音频播放器已停止")
 
 
+class EchoCanceller:
+    """回声消除器 - 使用自适应滤波算法"""
+
+    def __init__(self, sample_rate: int = 48000, frame_size: int = 9600):
+        """
+        初始化回声消除器
+
+        Args:
+            sample_rate: 采样率 (Hz)
+            frame_size: 每帧的采样点数
+        """
+        self.sample_rate = sample_rate
+        self.frame_size = frame_size
+
+        # 播放音频缓冲区（用于对比）
+        # 保存最近2秒的播放音频
+        buffer_size = int(sample_rate * 2 / frame_size)
+        self.playback_buffer = deque(maxlen=buffer_size)
+
+        # 回声消除参数
+        self.echo_threshold = 0.3  # 相似度阈值
+        self.volume_threshold = 500  # 音量阈值
+
+        logger.info(f"回声消除器已初始化 (采样率: {sample_rate}Hz, 帧大小: {frame_size})")
+
+    def add_playback_frame(self, audio_data: bytes) -> None:
+        """
+        添加播放的音频帧到缓冲区
+
+        Args:
+            audio_data: 播放的音频数据
+        """
+        # 转换为numpy数组并归一化
+        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+        audio_np = audio_np / 32768.0  # 归一化到 [-1, 1]
+        self.playback_buffer.append(audio_np)
+
+    def process_input_frame(self, input_data: bytes) -> tuple[bytes, bool]:
+        """
+        处理输入音频帧，检测并移除回声
+
+        Args:
+            input_data: 输入的音频数据
+
+        Returns:
+            (处理后的音频数据, 是否是回声)
+        """
+        # 转换输入音频为numpy数组
+        input_np = np.frombuffer(input_data, dtype=np.int16).astype(np.float32)
+        input_np = input_np / 32768.0  # 归一化
+
+        # 计算输入音频的音量
+        input_volume = np.abs(input_np).mean()
+
+        # 如果音量太低，直接返回（可能是静音）
+        if input_volume * 32768 < self.volume_threshold:
+            return input_data, False
+
+        # 如果播放缓冲区为空，说明没有播放，不可能是回声
+        if len(self.playback_buffer) == 0:
+            return input_data, False
+
+        # 检查是否与最近播放的音频相似（回声检测）
+        max_correlation = 0.0
+        for playback_frame in self.playback_buffer:
+            # 确保长度一致
+            min_len = min(len(input_np), len(playback_frame))
+            if min_len == 0:
+                continue
+
+            # 计算相关性（使用归一化互相关）
+            correlation = np.corrcoef(
+                input_np[:min_len],
+                playback_frame[:min_len]
+            )[0, 1]
+
+            if not np.isnan(correlation):
+                max_correlation = max(max_correlation, abs(correlation))
+
+        # 如果相关性高，认为是回声
+        is_echo = max_correlation > self.echo_threshold
+
+        if is_echo:
+            logger.debug(f"检测到回声 (相关性: {max_correlation:.2f})")
+            # 返回静音数据
+            silent_data = np.zeros_like(input_np)
+            silent_bytes = (silent_data * 32768).astype(np.int16).tobytes()
+            return silent_bytes, True
+        else:
+            return input_data, False
+
+    def clear_buffer(self) -> None:
+        """清空播放缓冲区"""
+        self.playback_buffer.clear()
+        logger.debug("回声消除器缓冲区已清空")
+
+
 def resample_audio(audio_data: bytes, ratio: int) -> bytes:
     """
     简单重采样：每隔 ratio 个采样点取一个
@@ -214,6 +319,7 @@ class MicrophoneListener:
         self.wake_word_enabled = wake_word_enabled
         self.wake_word = wake_word
         self.audio_player: Optional[AudioPlayer] = None
+        self.echo_canceller: Optional[EchoCanceller] = None
 
     def list_devices(self) -> None:
         """列出所有可用的音频输入设备"""
@@ -372,12 +478,19 @@ class MicrophoneListener:
                     # 读取音频数据 (48kHz)
                     data = self.stream.read(CHUNK, exception_on_overflow=False)
 
+                    # 回声消除处理
+                    if self.echo_canceller:
+                        processed_data, is_echo = self.echo_canceller.process_input_frame(data)
+                        if is_echo:
+                            # 是回声，跳过发送
+                            await asyncio.sleep(0.01)
+                            continue
+                        data = processed_data
+
                     # 重采样到 16kHz
                     resampled_data = resample_audio(data, RESAMPLE_RATIO)
 
-                    # 始终发送音频数据，即使在播放期间
-                    # 这样可以检测唤醒词并打断播放
-                    # 注意：播放期间会有短暂的回声，直到检测到唤醒词并中断
+                    # 发送音频数据
                     await self.websocket.send(resampled_data)
                     await asyncio.sleep(0.01)  # 小延迟避免过载
 
@@ -422,10 +535,16 @@ class MicrophoneListener:
             self.list_devices()
             return
 
+        # 初始化回声消除器
+        self.echo_canceller = EchoCanceller(
+            sample_rate=DEVICE_RATE,
+            frame_size=CHUNK
+        )
+
         # 初始化音频播放器 (用于 TTS)
         if self.enable_tts:
-            self.audio_player = AudioPlayer(self.audio)
-            logger.info("TTS 音频播放器已初始化")
+            self.audio_player = AudioPlayer(self.audio, echo_canceller=self.echo_canceller)
+            logger.info("TTS 音频播放器已初始化（含回声消除）")
 
         # 连接 WebSocket
         if not await self.connect_websocket():
