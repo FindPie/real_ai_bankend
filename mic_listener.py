@@ -206,7 +206,7 @@ class EchoCanceller:
 
     def add_playback_frame(self, audio_data: bytes) -> None:
         """
-        添加播放的音频帧到缓冲区
+        添加播放的音频帧到缓冲区（支持任意大小）
 
         Args:
             audio_data: 播放的音频数据
@@ -214,7 +214,13 @@ class EchoCanceller:
         # 转换为numpy数组并归一化
         audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
         audio_np = audio_np / 32768.0  # 归一化到 [-1, 1]
-        self.playback_buffer.append(audio_np)
+
+        # 将音频分割成标准帧大小存储
+        # 这样可以处理任意大小的输入
+        for i in range(0, len(audio_np), self.frame_size):
+            frame = audio_np[i:i + self.frame_size]
+            if len(frame) > 0:  # 只添加非空帧
+                self.playback_buffer.append(frame)
 
     def process_input_frame(self, input_data: bytes) -> tuple[bytes, bool]:
         """
@@ -246,17 +252,26 @@ class EchoCanceller:
         for playback_frame in self.playback_buffer:
             # 确保长度一致
             min_len = min(len(input_np), len(playback_frame))
-            if min_len == 0:
+            if min_len < 100:  # 太短的帧跳过（至少需要100个采样点）
                 continue
 
-            # 计算相关性（使用归一化互相关）
-            correlation = np.corrcoef(
-                input_np[:min_len],
-                playback_frame[:min_len]
-            )[0, 1]
+            try:
+                # 计算相关性（使用归一化互相关）
+                # 只对比相同长度的部分
+                input_segment = input_np[:min_len]
+                playback_segment = playback_frame[:min_len]
 
-            if not np.isnan(correlation):
-                max_correlation = max(max_correlation, abs(correlation))
+                # 计算标准差，避免常量信号
+                if np.std(input_segment) < 0.01 or np.std(playback_segment) < 0.01:
+                    continue
+
+                correlation = np.corrcoef(input_segment, playback_segment)[0, 1]
+
+                if not np.isnan(correlation):
+                    max_correlation = max(max_correlation, abs(correlation))
+            except Exception as e:
+                logger.debug(f"相关性计算异常: {e}")
+                continue
 
         # 如果相关性高，认为是回声
         is_echo = max_correlation > self.echo_threshold
