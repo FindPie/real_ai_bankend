@@ -25,7 +25,7 @@ DEFAULT_ENABLE_TTS = True  # 默认开启语音合成
 
 # TTS 配置
 DEFAULT_TTS_MODEL = "cosyvoice-v3-flash"
-DEFAULT_TTS_VOICE = "longxiaochun_v3"
+DEFAULT_TTS_VOICE = "longyan_v3"
 
 # 唤醒词配置
 WAKE_WORD = "贾维斯"
@@ -50,7 +50,7 @@ SYSTEM_PROMPT = """你是贾维斯，一个智能语音助手。请遵循以下�
 5. 如果需要列举，用"第一、第二"等口语化方式
 6. 控制回复长度，通常不超过4-5句话
 7. 使用自然、口语化的中文表达
-8. 联网搜索的url地址不需要生成"""
+8. 严禁在你的回答中出现任何网址、链接、URL"""
 
 # 唤醒词确认回复
 WAKE_WORD_ACK = "在呢，请稍等"
