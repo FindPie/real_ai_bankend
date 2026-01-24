@@ -206,8 +206,9 @@ class EchoCanceller:
         self._buffer_lock = threading.Lock()
 
         # 回声消除参数
-        self.echo_threshold = 0.3  # 相似度阈值
+        self.echo_threshold = 0.7  # 相似度阈值（提高到0.7，避免误判用户语音为回声）
         self.volume_threshold = 500  # 音量阈值
+        self.energy_ratio_threshold = 1.5  # 能量比阈值（输入/播放 > 1.5 说明有额外声音输入）
 
         logger.info(f"回声消除器已初始化 (采样率: {sample_rate}Hz, 帧大小: {frame_size})")
 
@@ -260,6 +261,8 @@ class EchoCanceller:
 
         # 检查是否与最近播放的音频相似（回声检测）
         max_correlation = 0.0
+        max_playback_energy = 0.0
+
         for playback_frame in playback_frames:
             # 确保长度一致
             min_len = min(len(input_np), len(playback_frame))
@@ -280,20 +283,32 @@ class EchoCanceller:
 
                 if not np.isnan(correlation):
                     max_correlation = max(max_correlation, abs(correlation))
+                    # 记录对应的播放帧能量
+                    playback_energy = np.abs(playback_segment).mean()
+                    max_playback_energy = max(max_playback_energy, playback_energy)
             except Exception as e:
                 logger.debug(f"相关性计算异常: {e}")
                 continue
 
-        # 如果相关性高，认为是回声
-        is_echo = max_correlation > self.echo_threshold
+        # 计算能量比（输入 / 播放）
+        energy_ratio = input_volume / max_playback_energy if max_playback_energy > 0.01 else 0
+
+        # 判断是否为回声：
+        # 1. 相关性高（超过阈值）
+        # 2. 且能量比不高（说明没有额外的声音输入，纯回声）
+        # 如果能量比 > energy_ratio_threshold，说明有人在说话，即使相关性高也不是回声
+        is_echo = (max_correlation > self.echo_threshold) and (energy_ratio < self.energy_ratio_threshold)
 
         if is_echo:
-            logger.debug(f"检测到回声 (相关性: {max_correlation:.2f})")
+            logger.debug(f"检测到回声 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})")
             # 返回静音数据
             silent_data = np.zeros_like(input_np)
             silent_bytes = (silent_data * 32768).astype(np.int16).tobytes()
             return silent_bytes, True
         else:
+            # 如果相关性高但能量比也高，说明有人在说话
+            if max_correlation > self.echo_threshold:
+                logger.debug(f"检测到高相关性但能量比高 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})，保留音频")
             return input_data, False
 
     def clear_buffer(self) -> None:
