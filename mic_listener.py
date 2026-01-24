@@ -148,6 +148,10 @@ class AudioPlayer:
             except Exception as e:
                 logger.warning(f"中断播放时出错: {e}")
 
+        # 清空回声消除器的缓冲区，避免旧的播放数据影响后续检测
+        if self.echo_canceller:
+            self.echo_canceller.clear_buffer()
+
         self.is_playing = False
         logger.info("TTS播放已被中断")
 
@@ -198,6 +202,9 @@ class EchoCanceller:
         buffer_size = int(sample_rate * 2 / frame_size)
         self.playback_buffer = deque(maxlen=buffer_size)
 
+        # 线程锁，保护 playback_buffer 的并发访问
+        self._buffer_lock = threading.Lock()
+
         # 回声消除参数
         self.echo_threshold = 0.3  # 相似度阈值
         self.volume_threshold = 500  # 音量阈值
@@ -217,10 +224,11 @@ class EchoCanceller:
 
         # 将音频分割成标准帧大小存储
         # 这样可以处理任意大小的输入
-        for i in range(0, len(audio_np), self.frame_size):
-            frame = audio_np[i:i + self.frame_size]
-            if len(frame) > 0:  # 只添加非空帧
-                self.playback_buffer.append(frame)
+        with self._buffer_lock:
+            for i in range(0, len(audio_np), self.frame_size):
+                frame = audio_np[i:i + self.frame_size]
+                if len(frame) > 0:  # 只添加非空帧
+                    self.playback_buffer.append(frame)
 
     def process_input_frame(self, input_data: bytes) -> tuple[bytes, bool]:
         """
@@ -244,12 +252,15 @@ class EchoCanceller:
             return input_data, False
 
         # 如果播放缓冲区为空，说明没有播放，不可能是回声
-        if len(self.playback_buffer) == 0:
-            return input_data, False
+        with self._buffer_lock:
+            if len(self.playback_buffer) == 0:
+                return input_data, False
+            # 创建播放缓冲区的副本，避免在迭代时被修改
+            playback_frames = list(self.playback_buffer)
 
         # 检查是否与最近播放的音频相似（回声检测）
         max_correlation = 0.0
-        for playback_frame in self.playback_buffer:
+        for playback_frame in playback_frames:
             # 确保长度一致
             min_len = min(len(input_np), len(playback_frame))
             if min_len < 100:  # 太短的帧跳过（至少需要100个采样点）
@@ -286,8 +297,9 @@ class EchoCanceller:
             return input_data, False
 
     def clear_buffer(self) -> None:
-        """清空播放缓冲区"""
-        self.playback_buffer.clear()
+        """清空播放缓冲区（线程安全）"""
+        with self._buffer_lock:
+            self.playback_buffer.clear()
         logger.debug("回声消除器缓冲区已清空")
 
 
