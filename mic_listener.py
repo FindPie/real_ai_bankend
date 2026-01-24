@@ -206,11 +206,16 @@ class EchoCanceller:
         self._buffer_lock = threading.Lock()
 
         # 回声消除参数
-        self.echo_threshold = 0.7  # 相似度阈值（提高到0.7，避免误判用户语音为回声）
+        self.echo_threshold = 0.5  # 相似度阈值（降低到0.5考虑时间对齐问题）
         self.volume_threshold = 500  # 音量阈值
-        self.energy_ratio_threshold = 1.5  # 能量比阈值（输入/播放 > 1.5 说明有额外声音输入）
+        self.energy_ratio_threshold = 1.15  # 能量比阈值（降低到1.15，更严格判断）
+
+        # 调试模式
+        self.debug_mode = True  # 开启调试日志
+        self.frame_count = 0  # 帧计数器（用于控制日志频率）
 
         logger.info(f"回声消除器已初始化 (采样率: {sample_rate}Hz, 帧大小: {frame_size})")
+        logger.info(f"回声消除参数: 相关性阈值={self.echo_threshold}, 能量比阈值={self.energy_ratio_threshold}")
 
     def add_playback_frame(self, audio_data: bytes) -> None:
         """
@@ -293,14 +298,27 @@ class EchoCanceller:
         # 计算能量比（输入 / 播放）
         energy_ratio = input_volume / max_playback_energy if max_playback_energy > 0.01 else 0
 
+        # 帧计数器，用于控制日志输出频率（每50帧输出一次）
+        self.frame_count += 1
+        should_log = (self.frame_count % 50 == 0) or (max_correlation > self.echo_threshold)
+
         # 判断是否为回声：
         # 1. 相关性高（超过阈值）
         # 2. 且能量比不高（说明没有额外的声音输入，纯回声）
         # 如果能量比 > energy_ratio_threshold，说明有人在说话，即使相关性高也不是回声
         is_echo = (max_correlation > self.echo_threshold) and (energy_ratio < self.energy_ratio_threshold)
 
+        # 详细的调试日志
+        if self.debug_mode and should_log:
+            logger.info(
+                f"[回声检测] 输入音量: {input_volume:.4f}, 播放音量: {max_playback_energy:.4f}, "
+                f"能量比: {energy_ratio:.2f}, 相关性: {max_correlation:.2f}, "
+                f"判定: {'回声(过滤)' if is_echo else '保留'}, "
+                f"缓冲区大小: {len(playback_frames)}"
+            )
+
         if is_echo:
-            logger.debug(f"检测到回声 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})")
+            logger.warning(f"⚠️ 过滤回声 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})")
             # 返回静音数据
             silent_data = np.zeros_like(input_np)
             silent_bytes = (silent_data * 32768).astype(np.int16).tobytes()
@@ -308,7 +326,7 @@ class EchoCanceller:
         else:
             # 如果相关性高但能量比也高，说明有人在说话
             if max_correlation > self.echo_threshold:
-                logger.debug(f"检测到高相关性但能量比高 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})，保留音频")
+                logger.success(f"✓ 检测到用户语音 (相关性: {max_correlation:.2f}, 能量比: {energy_ratio:.2f})，保留音频")
             return input_data, False
 
     def clear_buffer(self) -> None:
@@ -316,6 +334,15 @@ class EchoCanceller:
         with self._buffer_lock:
             self.playback_buffer.clear()
         logger.debug("回声消除器缓冲区已清空")
+
+    def set_thresholds(self, echo_threshold: float = None, energy_ratio_threshold: float = None) -> None:
+        """动态调整回声检测阈值"""
+        if echo_threshold is not None:
+            self.echo_threshold = echo_threshold
+            logger.info(f"回声相关性阈值已调整为: {echo_threshold}")
+        if energy_ratio_threshold is not None:
+            self.energy_ratio_threshold = energy_ratio_threshold
+            logger.info(f"能量比阈值已调整为: {energy_ratio_threshold}")
 
 
 def resample_audio(audio_data: bytes, ratio: int) -> bytes:
